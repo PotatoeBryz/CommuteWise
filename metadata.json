@@ -1,0 +1,7 @@
+{
+  "name": "CommuteWise",
+  "description": "A smart commuter application for the Tandang Sora jeepney route features interactive maps, trip planning, and an AI-powered commuter assistant.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
