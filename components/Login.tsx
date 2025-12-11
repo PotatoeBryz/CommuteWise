@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
-import { UserRole } from '../types';
-import { Navigation, User, Shield, Users, Mail, Lock, AlertCircle } from 'lucide-react';
+import { UserRole, DiscountType } from '../types';
+import { Navigation, User, Shield, Users, Mail, Lock, AlertCircle, Wallet, Award, CheckCircle2 } from 'lucide-react';
 
 interface LoginProps {
-  onLogin: (username: string, role: UserRole) => void;
+  onLogin: (username: string, role: UserRole, discountType: DiscountType) => void;
 }
 
 export const Login: React.FC<LoginProps> = ({ onLogin }) => {
@@ -15,21 +15,34 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
 
+  // Commuter Discount State
+  const [isDiscounted, setIsDiscounted] = useState(false);
+  const [selectedCategory, setSelectedCategory] = useState<DiscountType>('Student');
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
+    let finalDiscount: DiscountType = 'None';
+
     if (role === UserRole.ADMIN) {
       if (email === 'admin' && password === 'pass') {
-        onLogin('Administrator', role);
+        onLogin('Administrator', role, 'None');
       } else {
         setError('Invalid admin credentials. Please check your email and password.');
       }
       return;
     }
 
-    if (!username.trim() && role !== UserRole.GUEST) return;
-    onLogin(role === UserRole.GUEST ? 'Guest' : username, role);
+    if (role === UserRole.USER) {
+      if (!username.trim()) return;
+      if (isDiscounted) {
+        finalDiscount = selectedCategory;
+      }
+    }
+
+    // Guest always None, User depends on selection
+    onLogin(role === UserRole.GUEST ? 'Guest' : username, role, finalDiscount);
   };
 
   return (
@@ -38,7 +51,7 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
       <div className="absolute top-0 left-0 w-96 h-96 bg-blue-600/20 rounded-full blur-3xl -translate-x-1/2 -translate-y-1/2"></div>
       <div className="absolute bottom-0 right-0 w-96 h-96 bg-green-600/20 rounded-full blur-3xl translate-x-1/2 translate-y-1/2"></div>
 
-      <div className="bg-slate-800/80 backdrop-blur-md border border-slate-700 p-8 rounded-2xl shadow-2xl w-full max-w-md z-10">
+      <div className="bg-slate-800/80 backdrop-blur-md border border-slate-700 p-8 rounded-2xl shadow-2xl w-full max-w-md z-10 my-4">
         <div className="flex flex-col items-center mb-8">
           <div className="w-16 h-16 bg-gradient-to-tr from-blue-500 to-green-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg">
             <Navigation className="text-white w-8 h-8" />
@@ -120,20 +133,98 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
               </div>
             </div>
           ) : role === UserRole.USER ? (
-            <div>
-              <label className="block text-slate-400 text-sm font-medium mb-2">Username</label>
-              <input
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="Enter your username"
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                required
-              />
+            <div className="space-y-6">
+              <div>
+                <label className="block text-slate-400 text-sm font-medium mb-2">Username</label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="Enter your username"
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                  required
+                />
+              </div>
+
+              {/* Account Type Selection */}
+              <div>
+                <label className="block text-slate-400 text-sm font-medium mb-3">Account Type</label>
+                <div className="grid grid-cols-2 gap-4">
+                  <button
+                    type="button"
+                    onClick={() => setIsDiscounted(false)}
+                    className={`relative p-4 rounded-xl border-2 transition-all flex flex-col items-center gap-2 ${
+                      !isDiscounted 
+                        ? 'border-blue-500 bg-blue-900/20 shadow-[0_0_15px_rgba(59,130,246,0.3)]' 
+                        : 'border-slate-700 bg-slate-800/50 hover:border-slate-600'
+                    }`}
+                  >
+                    <div className={`p-2 rounded-full ${!isDiscounted ? 'bg-blue-100 text-blue-600' : 'bg-slate-700 text-slate-400'}`}>
+                      <Wallet className="w-6 h-6" />
+                    </div>
+                    <div className="text-center">
+                      <p className={`font-bold ${!isDiscounted ? 'text-white' : 'text-slate-300'}`}>Regular</p>
+                      <p className="text-[10px] text-slate-400">Full Fare</p>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsDiscounted(true)}
+                    className={`relative p-4 rounded-xl border-2 transition-all flex flex-col items-center gap-2 ${
+                      isDiscounted 
+                        ? 'border-green-500 bg-green-900/20 shadow-[0_0_15px_rgba(34,197,94,0.3)]' 
+                        : 'border-slate-700 bg-slate-800/50 hover:border-slate-600'
+                    }`}
+                  >
+                    {isDiscounted && (
+                      <div className="absolute top-2 right-2 text-green-500">
+                        <CheckCircle2 className="w-5 h-5 fill-current" />
+                      </div>
+                    )}
+                    <div className={`p-2 rounded-full ${isDiscounted ? 'bg-green-100 text-green-600' : 'bg-slate-700 text-slate-400'}`}>
+                      <Award className="w-6 h-6" />
+                    </div>
+                    <div className="text-center">
+                      <p className={`font-bold ${isDiscounted ? 'text-white' : 'text-slate-300'}`}>Discounted</p>
+                      <p className="text-[10px] text-slate-400">20% Off</p>
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Discount Category Selection (Only if Discounted is selected) */}
+              {isDiscounted && (
+                <div className="animate-in fade-in slide-in-from-top-4 duration-300">
+                  <label className="block text-slate-400 text-sm font-medium mb-3">Discount Category</label>
+                  <div className="space-y-2">
+                    {['Student', 'PWD', 'Senior Citizen'].map((cat) => (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setSelectedCategory(cat as DiscountType)}
+                        className={`w-full text-left px-4 py-3 rounded-lg border transition-all flex items-center gap-3 ${
+                          selectedCategory === cat 
+                            ? 'bg-green-900/30 border-green-500 text-white' 
+                            : 'bg-slate-900/50 border-slate-700 text-slate-400 hover:border-slate-600'
+                        }`}
+                      >
+                        <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${
+                          selectedCategory === cat ? 'border-green-500' : 'border-slate-500'
+                        }`}>
+                          {selectedCategory === cat && <div className="w-2 h-2 rounded-full bg-green-500" />}
+                        </div>
+                        <span className="text-sm font-medium">{cat}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <div className="text-center text-slate-400 text-sm py-2">
-              Access the map and route info without an account.
+              Access the map and route info without an account.<br/>
+              <span className="text-xs text-slate-500 italic">(Default regular rates apply)</span>
             </div>
           )}
 

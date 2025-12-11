@@ -7,8 +7,8 @@ declare global {
   }
 }
 
-// Detailed Polyline from Tandang Sora (Commonwealth) to Maharlika (QC)
-export const ROUTE_PATH: Coordinates[] = [
+// Default Path (Tandang Sora) - Kept for initialization
+export const DEFAULT_ROUTE_PATH: Coordinates[] = [
   { lat: 14.66870, lng: 121.05420 }, // Start: Tandang Sora Market (Commonwealth)
   { lat: 14.66930, lng: 121.05200 }, // Along Tandang Sora
   { lat: 14.67010, lng: 121.04950 },
@@ -32,9 +32,13 @@ export const ROUTE_PATH: Coordinates[] = [
   { lat: 14.64370, lng: 121.05850 }, // End: Maharlika St Area
 ];
 
+export const TANDANG_SORA_LOCATION = DEFAULT_ROUTE_PATH[0];
+export const MAHARLIKA_LOCATION = DEFAULT_ROUTE_PATH[DEFAULT_ROUTE_PATH.length - 1];
+
 interface MapProps {
   userLocation: Coordinates | null;
-  stops: RouteStop[]; // Now dynamic
+  routePath?: Coordinates[]; // Dynamic path
+  stops: RouteStop[]; 
   searchRoute?: {
     origin: string | Coordinates;
     destination: string | Coordinates;
@@ -42,6 +46,8 @@ interface MapProps {
   } | null;
   selectionMode?: 'origin' | 'destination' | null;
   focusedLocation?: Coordinates | null; // For admin "Locate" button
+  tempOrigin?: Coordinates | null; // Visual feedback for origin selection
+  tempDestination?: Coordinates | null; // Visual feedback for dest selection
   onMapClick?: (coords: Coordinates) => void;
   onRouteStatsCalculated?: (stats: { 
     totalDistance: string; 
@@ -52,10 +58,13 @@ interface MapProps {
 
 export const MapWithRoute: React.FC<MapProps> = ({ 
   userLocation, 
+  routePath = DEFAULT_ROUTE_PATH,
   stops,
   searchRoute, 
   selectionMode, 
   focusedLocation,
+  tempOrigin,
+  tempDestination,
   onMapClick, 
   onRouteStatsCalculated 
 }) => {
@@ -64,6 +73,8 @@ export const MapWithRoute: React.FC<MapProps> = ({
   const [userMarker, setUserMarker] = useState<any>(null);
   const directionsRendererRef = useRef<any>(null);
   const markersRef = useRef<any[]>([]);
+  const tempMarkersRef = useRef<any[]>([]); // For Origin/Dest selection pins
+  const routePolylineRef = useRef<any[]>([]); // To track and clear polylines
 
   // Refs for event listeners to avoid stale closures
   const onMapClickRef = useRef(onMapClick);
@@ -93,7 +104,12 @@ export const MapWithRoute: React.FC<MapProps> = ({
     if (map && focusedLocation) {
         map.panTo(focusedLocation);
         map.setZoom(17);
-        // Optional: Add a temporary bounce animation or highlight effect here if desired
+        new window.google.maps.Marker({
+            position: focusedLocation,
+            map: map,
+            animation: window.google.maps.Animation.DROP,
+            title: "Selected Stop"
+        });
     }
   }, [map, focusedLocation]);
 
@@ -113,16 +129,13 @@ export const MapWithRoute: React.FC<MapProps> = ({
             pixelOffset: new window.google.maps.Size(0, -5),
         });
         
-        // When closed manually (clicking X), reset active tracker
         infoWindowRef.current.addListener('closeclick', () => {
             activeElementRef.current = null;
         });
     }
 
-    // Center closer to the middle of the new route (Visayas Ave)
     const defaultCenter = { lat: 14.6625, lng: 121.0473 };
 
-    // Create Map Instance with better styling
     const mapInstance = new window.google.maps.Map(mapRef.current, {
       center: defaultCenter,
       zoom: 14,
@@ -143,53 +156,97 @@ export const MapWithRoute: React.FC<MapProps> = ({
       ],
     });
 
-    // --- ADD TRAFFIC LAYER ---
     const trafficLayer = new window.google.maps.TrafficLayer();
     trafficLayer.setMap(mapInstance);
 
-    // Click Listener for Map Selection & Clearing Selection
     mapInstance.addListener("click", (e: any) => {
-      // Priority 1: Picking Mode
       if (selectionModeRef.current && onMapClickRef.current) {
         onMapClickRef.current({ lat: e.latLng.lat(), lng: e.latLng.lng() });
         return;
       }
-
-      // Priority 2: Clear InfoWindow if clicking empty map space
       if (infoWindowRef.current) {
           infoWindowRef.current.close();
           activeElementRef.current = null;
       }
     });
 
-    // Draw the Jeepney Route Line with border for better visibility
-    // Outer border (simulated width)
-    new window.google.maps.Polyline({
-      path: ROUTE_PATH,
+    setMap(mapInstance);
+  }, []);
+
+  // Update Route Polyline when routePath changes
+  useEffect(() => {
+    if(!map || !routePath) return;
+
+    // Clear previous lines
+    routePolylineRef.current.forEach(line => line.setMap(null));
+    routePolylineRef.current = [];
+
+    // Draw Outer Border
+    const border = new window.google.maps.Polyline({
+      path: routePath,
       geodesic: true,
-      strokeColor: "#1e3a8a", // Dark Blue Border
+      strokeColor: "#1e3a8a", 
       strokeOpacity: 0.5,
       strokeWeight: 10,
-      map: mapInstance,
+      map: map,
       zIndex: 1,
-      clickable: false // Outer border doesn't need to be clickable
+      clickable: false 
     });
 
-    // Inner Line - Interactive
-    const routeLine = new window.google.maps.Polyline({
-      path: ROUTE_PATH,
+    // Draw Inner Line
+    const mainLine = new window.google.maps.Polyline({
+      path: routePath,
       geodesic: true,
-      strokeColor: "#3b82f6", // Bright Blue
-      strokeOpacity: 0.8, // Slightly transparent to let traffic layer shine through if underneath
+      strokeColor: "#3b82f6", 
+      strokeOpacity: 0.8, 
       strokeWeight: 6,
-      map: mapInstance,
+      map: map,
       zIndex: 2,
       clickable: true,
       cursor: 'pointer'
     });
 
-    setMap(mapInstance);
-  }, []);
+    routePolylineRef.current.push(border, mainLine);
+
+  }, [map, routePath]);
+
+  // Manage Temp Markers (Selection Pins)
+  useEffect(() => {
+      if (!map) return;
+
+      // Clear existing temp markers
+      tempMarkersRef.current.forEach(marker => marker.setMap(null));
+      tempMarkersRef.current = [];
+
+      if (tempOrigin) {
+          const startMarker = new window.google.maps.Marker({
+              position: tempOrigin,
+              map: map,
+              icon: {
+                  url: "http://maps.google.com/mapfiles/ms/icons/green-dot.png", // Green for Origin
+                  scaledSize: new window.google.maps.Size(40, 40)
+              },
+              title: "Starting Point",
+              animation: window.google.maps.Animation.DROP
+          });
+          tempMarkersRef.current.push(startMarker);
+      }
+
+      if (tempDestination) {
+          const endMarker = new window.google.maps.Marker({
+              position: tempDestination,
+              map: map,
+              icon: {
+                  url: "http://maps.google.com/mapfiles/ms/icons/red-dot.png", // Red for Destination
+                  scaledSize: new window.google.maps.Size(40, 40)
+              },
+              title: "Destination",
+              animation: window.google.maps.Animation.DROP
+          });
+          tempMarkersRef.current.push(endMarker);
+      }
+
+  }, [map, tempOrigin, tempDestination]);
 
   // Update Markers when 'stops' prop changes
   useEffect(() => {
@@ -199,23 +256,40 @@ export const MapWithRoute: React.FC<MapProps> = ({
     markersRef.current.forEach(marker => marker.setMap(null));
     markersRef.current = [];
 
-    // Helper to find nearest stop (used for RouteLine click)
-    // We attach this logic to the route line click event dynamically or keep it simple
-    // For now, re-attaching listeners is complex, so we will skip the route-line click "nearest stop" logic update 
-    // or assume the component remounts. Ideally, we use a ref for 'stops' inside the listener.
-    
     // Add Stops Markers
     stops.forEach((stop) => {
+      // Different icon for Terminals vs Regular Stops
+      let icon = null;
+      if (stop.isTerminal) {
+         icon = {
+             path: window.google.maps.SymbolPath.BACKWARD_CLOSED_ARROW,
+             scale: 5,
+             fillColor: "#ea580c", // Orange for terminal
+             fillOpacity: 1,
+             strokeColor: "#ffffff",
+             strokeWeight: 2,
+         };
+      } else {
+         icon = {
+             path: window.google.maps.SymbolPath.CIRCLE,
+             scale: 5,
+             fillColor: "#3b82f6", // Blue for stop
+             fillOpacity: 1,
+             strokeColor: "#ffffff",
+             strokeWeight: 2,
+         }
+      }
+
       const marker = new window.google.maps.Marker({
         position: stop.coords,
         map: map,
         title: stop.name,
+        icon: icon,
         animation: window.google.maps.Animation.DROP,
         zIndex: 3
       });
 
       marker.addListener("click", () => {
-         // Prevent if selecting
          if (selectionModeRef.current) {
             if (onMapClickRef.current) {
                 onMapClickRef.current(stop.coords);
@@ -223,19 +297,22 @@ export const MapWithRoute: React.FC<MapProps> = ({
             return;
          }
 
-         // Toggle Logic for Markers
          if (activeElementRef.current === stop.id) {
              infoWindowRef.current.close();
              activeElementRef.current = null;
              return;
          }
 
+         const typeLabel = stop.isTerminal ? "Terminal" : "Stop";
+         const color = stop.isTerminal ? "#ea580c" : "#3b82f6";
+
          const content = `
           <div style="font-family: sans-serif; padding: 8px; min-width: 160px;">
             <div style="display:flex; align-items:center; margin-bottom: 6px;">
-               <div style="width: 8px; height: 8px; background: #3b82f6; border-radius: 50%; margin-right: 6px;"></div>
+               <div style="width: 8px; height: 8px; background: ${color}; border-radius: 50%; margin-right: 6px;"></div>
                <h3 style="font-weight: bold; color: #1e293b; margin:0; font-size: 14px;">${stop.name}</h3>
             </div>
+            <span style="font-size: 10px; font-weight: bold; color: white; background: ${color}; padding: 2px 6px; border-radius: 4px; margin-bottom: 4px; display: inline-block;">${typeLabel}</span>
             <p style="font-size: 12px; color: #64748b; margin:0;">${stop.description}</p>
           </div>
         `;
@@ -258,12 +335,11 @@ export const MapWithRoute: React.FC<MapProps> = ({
   useEffect(() => {
     if (!map || !searchRoute || !searchRoute.origin || !searchRoute.destination) return;
 
-    // Initialize DirectionsRenderer if not exists
     if (!directionsRendererRef.current) {
       directionsRendererRef.current = new window.google.maps.DirectionsRenderer({
         map: map,
-        suppressMarkers: false,
-        preserveViewport: false, // Allow renderer to change viewport (default), but we will also enforce it below
+        suppressMarkers: false, // We want the A/B markers from directions service as well
+        preserveViewport: false,
         polylineOptions: {
           strokeColor: "#8b5cf6", // Purple for calculated user trip
           strokeOpacity: 0.7,
@@ -279,15 +355,13 @@ export const MapWithRoute: React.FC<MapProps> = ({
         origin: searchRoute.origin,
         destination: searchRoute.destination,
         waypoints: searchRoute.waypoints,
-        travelMode: window.google.maps.TravelMode.DRIVING, // Approximation for Jeepney/Road traffic
+        travelMode: window.google.maps.TravelMode.DRIVING, 
         provideRouteAlternatives: false,
       },
       (result: any, status: any) => {
         if (status === 'OK' && result) {
           directionsRendererRef.current.setDirections(result);
           
-          // --- FORCE FOCUS ON ROUTE ---
-          // Explicitly fit bounds to the calculated route to ensure user sees the "Find Route" result clearly
           const route = result.routes[0];
           if (route.bounds) {
              map.fitBounds(route.bounds);
@@ -298,7 +372,6 @@ export const MapWithRoute: React.FC<MapProps> = ({
             duration: { text: leg.duration?.text || '', value: leg.duration?.value || 0 }
           }));
 
-          // Calculate totals manually to be safe
           let totalDistVal = 0;
           let totalDurVal = 0;
           legs.forEach((leg: any) => {
@@ -306,13 +379,10 @@ export const MapWithRoute: React.FC<MapProps> = ({
             totalDurVal += leg.duration.value;
           });
 
-          // Convert back to text (rough approx or usage of response)
-          // For simplicity, we can use the sum of values if legs > 1
           const totalDistanceText = legs.length > 1 
              ? (totalDistVal / 1000).toFixed(1) + " km" 
              : legs[0].distance.text;
              
-          // Simple formatting for duration
           const totalDurationMinutes = Math.round(totalDurVal / 60);
           const totalDurationText = totalDurationMinutes > 60 
             ? Math.floor(totalDurationMinutes / 60) + " hr " + (totalDurationMinutes % 60) + " min"
@@ -343,7 +413,6 @@ export const MapWithRoute: React.FC<MapProps> = ({
     if (userMarker) {
       userMarker.setPosition(userLocation);
     } else {
-      // Create user marker with a blue dot style
       const marker = new window.google.maps.Marker({
         position: userLocation,
         map: map,

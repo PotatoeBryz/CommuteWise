@@ -1,27 +1,69 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { User, UserRole, ChatMessage, FeedbackItem, Coordinates, TripHistoryItem, RouteStop } from '../types';
-import { MapWithRoute, ROUTE_PATH } from './MapWithRoute';
+import { User, UserRole, ChatMessage, FeedbackItem, Coordinates, TripHistoryItem, RouteStop, RouteLeg, TransportRoute } from '../types';
+import { MapWithRoute, DEFAULT_ROUTE_PATH, TANDANG_SORA_LOCATION, MAHARLIKA_LOCATION } from './MapWithRoute';
 import { getGeminiResponse } from '../services/geminiService';
 import { 
   Menu, LogOut, MapPin, Navigation, Send, Loader2, Bot, 
   Search, Info, BarChart3, Route, Warehouse, DollarSign, MessageSquare, LayoutGrid,
   Bug, X, CheckCircle, Clock, CheckSquare, AlertCircle, ArrowUpDown, Crosshair,
   Footprints, Bus, MapPin as MapPinIcon, Pointer, History, Calendar, Trash2, ArrowRight,
-  Users, ArrowUpRight, RefreshCw, Download, TrendingUp, Flag, XCircle, Play, Star, ChevronLeft, CreditCard, Save, Edit2, Plus
+  Users, ArrowUpRight, RefreshCw, Download, TrendingUp, Flag, XCircle, Play, Star, ChevronLeft, CreditCard, Save, Edit2, Plus, ArrowLeftRight, Repeat, Map, Undo, Eraser, Filter, MessageCircle,
+  Activity, PieChart, ThumbsUp, AlertTriangle, Lightbulb, Percent, Shield, Zap
 } from 'lucide-react';
 
-// Hardcoded Terminal Location (Matches Tandang Sora Market in MapWithRoute)
-const TERMINAL_LOCATION: Coordinates = { lat: 14.66870, lng: 121.05420 };
-const TERMINAL_NAME = "Tandang Sora Market Terminal";
+const TANDANG_SORA_NAME = "Tandang Sora Market";
+const MAHARLIKA_NAME = "Maharlika (Teacher's Village)";
 
 // Default Stops Data (Used if no local storage)
 const DEFAULT_STOPS: RouteStop[] = [
-  { id: '1', name: 'Tandang Sora Market', coords: { lat: 14.6687, lng: 121.0542 }, description: 'Terminal at Commonwealth' },
-  { id: '2', name: 'Visayas Intersection', coords: { lat: 14.6714, lng: 121.0449 }, description: 'Corner Tandang Sora & Visayas' },
-  { id: '3', name: 'Congressional Ave', coords: { lat: 14.6625, lng: 121.0473 }, description: 'Sanville / Congressional Cross' },
-  { id: '4', name: 'QC City Hall / Kalayaan', coords: { lat: 14.6480, lng: 121.0540 }, description: 'Kalayaan Avenue Drop-off' },
-  { id: '5', name: 'Maharlika', coords: { lat: 14.6437, lng: 121.0585 }, description: 'End of Route (Maharlika St)' },
+  { id: '1', name: 'Tandang Sora Market', coords: TANDANG_SORA_LOCATION, description: 'Terminal at Commonwealth', isTerminal: true },
+  { id: '2', name: 'Visayas Intersection', coords: { lat: 14.6714, lng: 121.0449 }, description: 'Corner Tandang Sora & Visayas', isTerminal: false },
+  { id: '3', name: 'Congressional Ave', coords: { lat: 14.6625, lng: 121.0473 }, description: 'Sanville / Congressional Cross', isTerminal: false },
+  { id: '4', name: 'QC City Hall / Kalayaan', coords: { lat: 14.6480, lng: 121.0540 }, description: 'Kalayaan Avenue Drop-off', isTerminal: false },
+  { id: '5', name: 'Maharlika', coords: MAHARLIKA_LOCATION, description: 'End of Route (Maharlika St)', isTerminal: true },
 ];
+
+const INITIAL_ROUTES: TransportRoute[] = [
+    {
+        id: '1',
+        name: 'Tandang Sora - Maharlika',
+        path: DEFAULT_ROUTE_PATH,
+        stops: DEFAULT_STOPS,
+        status: 'active'
+    }
+];
+
+// --- Helper Functions for Geometry ---
+const getDistanceSq = (p1: Coordinates, p2: Coordinates) => {
+    return Math.pow(p1.lat - p2.lat, 2) + Math.pow(p1.lng - p2.lng, 2);
+};
+
+const findNearestPointOnRoute = (target: Coordinates, path: Coordinates[]) => {
+    let nearest = path[0];
+    let minDist = Infinity;
+    path.forEach(p => {
+        const d = getDistanceSq(target, p);
+        if (d < minDist) {
+            minDist = d;
+            nearest = p;
+        }
+    });
+    return nearest;
+};
+
+// --- Real Walking Estimate Helper ---
+// Average walking speed ~4.8km/h = ~80 meters per minute
+const calculateWalkingTime = (distanceMeters: number): string => {
+    if (distanceMeters <= 0) return "0 min";
+    const minutes = Math.ceil(distanceMeters / 80);
+    if (minutes >= 60) {
+        const hrs = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        return `${hrs} hr ${mins} min`;
+    }
+    return `${minutes} min`;
+};
+
 
 // --- Sub-component: Autocomplete Input ---
 interface LocationAutocompleteProps {
@@ -180,12 +222,14 @@ interface GlobalStats {
     totalSearches: number;
     totalRevenue: number; // Simulated based on fares
     topLocations: Record<string, number>;
+    hourlyActivity: Record<number, number>; // Hour (0-23) -> Count
 }
 
 interface FareConfig {
   baseFare: number;
   baseKm: number;
   perKmRate: number;
+  discountRate: number; // Percentage (e.g., 20)
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
@@ -194,15 +238,25 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   const [activeAdminMenu, setActiveAdminMenu] = useState('Dashboard');
   const [userLocation, setUserLocation] = useState<{lat: number, lng: number} | null>(null);
   
-  // Route Planning State
+  // Routes State (Scalable)
+  const [routes, setRoutes] = useState<TransportRoute[]>(INITIAL_ROUTES);
+  const [selectedAdminRouteId, setSelectedAdminRouteId] = useState<string>(INITIAL_ROUTES[0].id);
+
+  // Route Planning State (User side uses first route for now)
   const [originInput, setOriginInput] = useState('');
   const [destinationInput, setDestinationInput] = useState('');
+  // Temp coordinates for pins before calculation
+  const [selectedOriginCoords, setSelectedOriginCoords] = useState<Coordinates | null>(null);
+  const [selectedDestinationCoords, setSelectedDestinationCoords] = useState<Coordinates | null>(null);
+
   const [isNavigating, setIsNavigating] = useState(false);
+  const [routeDirection, setRouteDirection] = useState<'forward' | 'backward'>('forward'); // Forward = TS -> Maharlika
   
   // Map Selection State
   const [pickingMode, setPickingMode] = useState<'origin' | 'destination' | null>(null);
-  // Admin Map Focus State
+  // Admin Map States
   const [focusedLocation, setFocusedLocation] = useState<Coordinates | null>(null);
+  const [adminMapMode, setAdminMapMode] = useState<'view' | 'edit_path' | 'add_stop'>('view');
 
   const [searchTrigger, setSearchTrigger] = useState<{
       origin: string | Coordinates, 
@@ -214,7 +268,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
       totalDistance: string;
       totalDuration: string;
       fare: string;
-      legs?: { distance: { text: string; value: number }, duration: { text: string; value: number } }[]
+      legs: RouteLeg[] 
   } | null>(null);
 
   const [isCalculating, setIsCalculating] = useState(false);
@@ -234,37 +288,51 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   // Feedback State (Shared)
   const [feedbacks, setFeedbacks] = useState<FeedbackItem[]>([]);
   const [showFeedbackModal, setShowFeedbackModal] = useState(false);
+  const [feedbackModalTab, setFeedbackModalTab] = useState<'new' | 'history'>('new');
   const [feedbackType, setFeedbackType] = useState<'bug' | 'suggestion'>('bug');
   const [feedbackText, setFeedbackText] = useState('');
   const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
   const [showSuccessToast, setShowSuccessToast] = useState(false);
+  
+  // Admin Feedback Reply State
+  const [adminReplyText, setAdminReplyText] = useState('');
+  const [replyingToId, setReplyingToId] = useState<string | null>(null);
+  const [feedbackFilter, setFeedbackFilter] = useState<'all' | 'pending' | 'resolved'>('all');
 
   // Trip History State
   const [tripHistory, setTripHistory] = useState<TripHistoryItem[]>([]);
+  const [viewingHistoryItem, setViewingHistoryItem] = useState<TripHistoryItem | null>(null);
 
   // Analytics State
   const [globalStats, setGlobalStats] = useState<GlobalStats>({
       totalSearches: 0,
       totalRevenue: 0,
-      topLocations: {}
+      topLocations: {},
+      hourlyActivity: {}
   });
 
   // Fare Configuration State (Editable by Admin)
   const [fareConfig, setFareConfig] = useState<FareConfig>({
       baseFare: 13.00,
       baseKm: 4,
-      perKmRate: 1.75
+      perKmRate: 1.75,
+      discountRate: 20 // Default 20%
   });
   const [isEditingFare, setIsEditingFare] = useState(false);
   const [tempFareConfig, setTempFareConfig] = useState<FareConfig>(fareConfig);
 
-  // Stops State (Editable by Admin)
-  const [stops, setStops] = useState<RouteStop[]>(DEFAULT_STOPS);
+  // Admin Route Editing State
   const [isEditingStops, setIsEditingStops] = useState(false);
   const [editingStopId, setEditingStopId] = useState<string | null>(null);
-  const [tempStopData, setTempStopData] = useState<{name: string, description: string}>({ name: '', description: '' });
+  const [tempStopData, setTempStopData] = useState<{name: string, description: string, isTerminal: boolean}>({ name: '', description: '', isTerminal: false });
   // View Details Toggle for Routes
   const [showRouteDetails, setShowRouteDetails] = useState(false);
+
+  // Helper to get active route data for admin
+  const activeAdminRoute = routes.find(r => r.id === selectedAdminRouteId) || routes[0];
+
+  // Helper to get active route for user (assuming single route for now)
+  const userActiveRoute = routes[0]; 
 
   // Load Data on mount
   useEffect(() => {
@@ -276,7 +344,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
 
     // History (User Specific)
     if (user.role !== UserRole.GUEST) {
-        const historyKey = `commutewise_history_${user.username}`;
+        // CHANGED KEY to reset mock data
+        const historyKey = `commutewise_history_v2_${user.username}`;
         const storedHistory = localStorage.getItem(historyKey);
         if (storedHistory) {
             setTripHistory(JSON.parse(storedHistory));
@@ -296,12 +365,17 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
         setTempFareConfig(JSON.parse(storedFareConfig));
     }
 
-    // Stops Config
-    const storedStops = localStorage.getItem('commutewise_stops');
-    if (storedStops) {
-        setStops(JSON.parse(storedStops));
+    // Routes Config
+    const storedRoutes = localStorage.getItem('commutewise_routes');
+    if (storedRoutes) {
+        setRoutes(JSON.parse(storedRoutes));
     }
   }, [user]);
+
+  // Persist routes whenever they change
+  useEffect(() => {
+      localStorage.setItem('commutewise_routes', JSON.stringify(routes));
+  }, [routes]);
 
   useEffect(() => {
     // Mock getting location - Quezon City default if permission denied
@@ -354,22 +428,64 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     setIsTyping(false);
   };
 
-  const handleCalculateRoute = () => {
-    if (originInput.trim() && destinationInput.trim()) {
-      setIsCalculating(true);
-      // Reset previous stats when calculating a new route
-      setRouteStats(null);
-      
-      const origin = originInput === "Your Location" && userLocation ? userLocation : originInput;
-      const destination = destinationInput === "Your Location" && userLocation ? userLocation : destinationInput;
-
-      // Enforce the logic: Origin -> Terminal -> Destination
-      // We pass the Terminal as a waypoint
-      setSearchTrigger({
-        origin,
-        destination,
-        waypoints: [{ location: TERMINAL_LOCATION, stopover: true }]
+  const geocodeLocation = (location: string | Coordinates): Promise<Coordinates> => {
+      return new Promise((resolve, reject) => {
+          if (typeof location !== 'string') {
+              resolve(location);
+              return;
+          }
+          if (location === "Your Location" && userLocation) {
+              resolve(userLocation);
+              return;
+          }
+          if (!window.google || !window.google.maps) {
+              reject("Google Maps not loaded");
+              return;
+          }
+          const geocoder = new window.google.maps.Geocoder();
+          geocoder.geocode({ address: location, componentRestrictions: { country: 'ph' } }, (results: any, status: any) => {
+              if (status === 'OK' && results[0]) {
+                  resolve({
+                      lat: results[0].geometry.location.lat(),
+                      lng: results[0].geometry.location.lng()
+                  });
+              } else {
+                  reject(status);
+              }
+          });
       });
+  };
+
+  const handleCalculateRoute = async () => {
+    if (!originInput.trim() || !destinationInput.trim()) return;
+
+    setIsCalculating(true);
+    setRouteStats(null);
+
+    try {
+        const originCoords = await geocodeLocation(originInput);
+        const destinationCoords = await geocodeLocation(destinationInput);
+
+        // Update selected coordinates for map visualization
+        setSelectedOriginCoords(originCoords);
+        setSelectedDestinationCoords(destinationCoords);
+
+        const pickupPoint = findNearestPointOnRoute(originCoords, userActiveRoute.path);
+        const dropoffPoint = findNearestPointOnRoute(destinationCoords, userActiveRoute.path);
+
+        setSearchTrigger({
+            origin: originCoords,
+            destination: destinationCoords,
+            waypoints: [
+                { location: pickupPoint, stopover: true },
+                { location: dropoffPoint, stopover: true }
+            ]
+        });
+
+    } catch (error) {
+        console.error("Routing error:", error);
+        alert("Could not find locations. Please try being more specific.");
+        setIsCalculating(false);
     }
   };
 
@@ -377,19 +493,24 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     const temp = originInput;
     setOriginInput(destinationInput);
     setDestinationInput(temp);
+    // Swap coords too
+    const tempCoords = selectedOriginCoords;
+    setSelectedOriginCoords(selectedDestinationCoords);
+    setSelectedDestinationCoords(tempCoords);
   };
   
   const handleCancelRoute = () => {
     setRouteStats(null);
     setSearchTrigger(null);
+    setSelectedOriginCoords(null);
+    setSelectedDestinationCoords(null);
     setIsNavigating(false);
   };
 
-  // --- Map Picking Logic ---
   const handleStartPick = (mode: 'origin' | 'destination') => {
       setPickingMode(mode);
       if (window.innerWidth < 768) {
-        setSidebarOpen(false); // Close sidebar on mobile to see map
+        setSidebarOpen(false); 
       }
   };
 
@@ -399,54 +520,101 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
   };
 
   const handleMapClick = (coords: Coordinates) => {
-      if (!pickingMode || !window.google || !window.google.maps) return;
+      if (isAdmin && adminMapMode === 'edit_path') {
+          const updatedRoutes = routes.map(route => {
+              if (route.id === selectedAdminRouteId) {
+                  return { ...route, path: [...route.path, coords] };
+              }
+              return route;
+          });
+          setRoutes(updatedRoutes);
+          return;
+      }
 
-      const geocoder = new window.google.maps.Geocoder();
-      geocoder.geocode({ location: coords }, (results: any, status: any) => {
-          if (status === 'OK' && results[0]) {
-              const address = results[0].formatted_address;
-              if (pickingMode === 'origin') setOriginInput(address);
-              if (pickingMode === 'destination') setDestinationInput(address);
-          } else {
-              // Fallback if address not found
-              const str = `${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}`;
-              if (pickingMode === 'origin') setOriginInput(str);
-              if (pickingMode === 'destination') setDestinationInput(str);
-          }
+      if (isAdmin && adminMapMode === 'add_stop') {
+          const newStop: RouteStop = {
+              id: Date.now().toString(),
+              name: "New Stop",
+              coords: coords,
+              description: "New stop description",
+              isTerminal: false
+          };
+          const updatedRoutes = routes.map(route => {
+              if (route.id === selectedAdminRouteId) {
+                  return { ...route, stops: [...route.stops, newStop] };
+              }
+              return route;
+          });
+          setRoutes(updatedRoutes);
+          setAdminMapMode('view');
           
-          setPickingMode(null);
-          setSidebarOpen(true); // Re-open sidebar
-      });
+          setEditingStopId(newStop.id);
+          setTempStopData({ name: newStop.name, description: newStop.description || '', isTerminal: false });
+          return;
+      }
+
+      if (pickingMode && window.google && window.google.maps) {
+          // Immediately set coordinates to show pin
+          if (pickingMode === 'origin') setSelectedOriginCoords(coords);
+          if (pickingMode === 'destination') setSelectedDestinationCoords(coords);
+
+          const geocoder = new window.google.maps.Geocoder();
+          geocoder.geocode({ location: coords }, (results: any, status: any) => {
+              if (status === 'OK' && results[0]) {
+                  const address = results[0].formatted_address;
+                  if (pickingMode === 'origin') setOriginInput(address);
+                  if (pickingMode === 'destination') setDestinationInput(address);
+              } else {
+                  const str = `${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}`;
+                  if (pickingMode === 'origin') setOriginInput(str);
+                  if (pickingMode === 'destination') setDestinationInput(str);
+              }
+              
+              setPickingMode(null);
+              setSidebarOpen(true); 
+          });
+      }
   };
 
   const calculateJeepneyFare = (distanceMeters: number): string => {
-    // Fare Matrix (Uses Admin Configured Values)
     const baseFare = fareConfig.baseFare;
-    const baseKm = fareConfig.baseKm * 1000; // convert km to meters
+    const baseKm = fareConfig.baseKm * 1000; 
     const costPerKm = fareConfig.perKmRate;
     
     if (distanceMeters <= 0) return "₱0.00";
+    
+    let totalFare = 0;
+
     if (distanceMeters <= baseKm) {
-        return `₱${baseFare.toFixed(2)}`;
+        totalFare = baseFare;
+    } else {
+        const extraMeters = distanceMeters - baseKm;
+        const extraKm = Math.ceil(extraMeters / 1000); 
+        totalFare = baseFare + (extraKm * costPerKm);
     }
 
-    const extraMeters = distanceMeters - baseKm;
-    const extraKm = Math.ceil(extraMeters / 1000); // Usually rounded up to next km
-    const totalFare = baseFare + (extraKm * costPerKm);
+    if (user.role === UserRole.USER && user.discountType && user.discountType !== 'None') {
+        const discountAmount = totalFare * (fareConfig.discountRate / 100);
+        totalFare = totalFare - discountAmount;
+    }
     
     return `₱${totalFare.toFixed(2)}`;
   };
 
   const updateGlobalStats = (fareStr: string) => {
      const fareValue = parseFloat(fareStr.replace('₱', '')) || 0;
+     const currentHour = new Date().getHours();
+
      const newStats = {
-         ...globalStats,
          totalSearches: globalStats.totalSearches + 1,
          totalRevenue: globalStats.totalRevenue + fareValue,
-         // Rudimentary location tracking (would need better cleaning in real app)
          topLocations: {
              ...globalStats.topLocations,
              [destinationInput]: (globalStats.topLocations[destinationInput] || 0) + 1
+         },
+         hourlyActivity: {
+             ...globalStats.hourlyActivity,
+             [currentHour]: (globalStats.hourlyActivity[currentHour] || 0) + 1
          }
      };
      setGlobalStats(newStats);
@@ -455,7 +623,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
 
   const handleResetAnalytics = () => {
      if(confirm("Are you sure you want to reset all analytics data?")) {
-         const reset = { totalSearches: 0, totalRevenue: 0, topLocations: {} };
+         const reset = { totalSearches: 0, totalRevenue: 0, topLocations: {}, hourlyActivity: {} };
          setGlobalStats(reset);
          localStorage.setItem('commutewise_stats', JSON.stringify(reset));
      }
@@ -469,52 +637,77 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
       alert("Fare matrix updated successfully!");
   };
 
-  // --- Stop Management Functions ---
   const handleEditStop = (stop: RouteStop) => {
       setEditingStopId(stop.id);
-      setTempStopData({ name: stop.name, description: stop.description || '' });
+      setTempStopData({ name: stop.name, description: stop.description || '', isTerminal: stop.isTerminal || false });
   };
 
-  const handleSaveStop = (id: string) => {
-      const updatedStops = stops.map(s => 
-          s.id === id ? { ...s, name: tempStopData.name, description: tempStopData.description } : s
-      );
-      setStops(updatedStops);
-      localStorage.setItem('commutewise_stops', JSON.stringify(updatedStops));
+  const handleSaveStop = (stopId: string) => {
+      const updatedRoutes = routes.map(route => {
+          if (route.id === selectedAdminRouteId) {
+              return {
+                  ...route,
+                  stops: route.stops.map(s => 
+                      s.id === stopId ? { ...s, name: tempStopData.name, description: tempStopData.description, isTerminal: tempStopData.isTerminal } : s
+                  )
+              };
+          }
+          return route;
+      });
+      setRoutes(updatedRoutes);
       setEditingStopId(null);
   };
 
-  const handleDeleteStop = (id: string) => {
+  const handleDeleteStop = (stopId: string) => {
       if(confirm("Are you sure you want to delete this stop?")) {
-          const updatedStops = stops.filter(s => s.id !== id);
-          setStops(updatedStops);
-          localStorage.setItem('commutewise_stops', JSON.stringify(updatedStops));
+          const updatedRoutes = routes.map(route => {
+             if (route.id === selectedAdminRouteId) {
+                 return { ...route, stops: route.stops.filter(s => s.id !== stopId) };
+             }
+             return route;
+          });
+          setRoutes(updatedRoutes);
       }
   };
 
-  const handleAddStop = () => {
-      // In a real app, this would probably let you pick from the map.
-      // For this demo, we'll just add a placeholder at the current map center (approx)
-      // or at the user location.
-      const newStop: RouteStop = {
+  const handleStartAddStop = () => {
+      setAdminMapMode('add_stop');
+  };
+  
+  const handleAddRoute = () => {
+      const newRoute: TransportRoute = {
           id: Date.now().toString(),
-          name: "New Stop",
-          coords: userLocation || TERMINAL_LOCATION, // Default to terminal if no loc
-          description: "Description of new stop"
+          name: "New Route",
+          path: [],
+          stops: [],
+          status: 'active'
       };
-      const updatedStops = [...stops, newStop];
-      setStops(updatedStops);
-      localStorage.setItem('commutewise_stops', JSON.stringify(updatedStops));
-      
-      // Immediately edit the new stop
-      setEditingStopId(newStop.id);
-      setTempStopData({ name: newStop.name, description: newStop.description || '' });
+      setRoutes([...routes, newRoute]);
+      setSelectedAdminRouteId(newRoute.id);
+      setAdminMapMode('edit_path');
+  };
+
+  const handleClearPath = () => {
+      if(confirm("Clear the entire route path?")) {
+          const updatedRoutes = routes.map(r => r.id === selectedAdminRouteId ? { ...r, path: [] } : r);
+          setRoutes(updatedRoutes);
+      }
+  };
+
+  const handleUndoPathPoint = () => {
+      const updatedRoutes = routes.map(r => {
+          if (r.id === selectedAdminRouteId && r.path.length > 0) {
+              const newPath = [...r.path];
+              newPath.pop();
+              return { ...r, path: newPath };
+          }
+          return r;
+      });
+      setRoutes(updatedRoutes);
   };
 
   const handleLocateStop = (coords: Coordinates) => {
       setFocusedLocation(coords);
-      // Close sidebar or minimize functionality to show map
-      setActiveAdminMenu('Locations'); // This hides the overlay in our render logic
   };
 
   const handleRouteStatsCalculated = (stats: { 
@@ -523,39 +716,43 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     legs: { distance: { text: string; value: number }, duration: { text: string; value: number } }[] 
   }) => {
     
-    // Logic: 
-    // Leg 0: Origin -> Terminal (Access leg, no jeep fare)
-    // Leg 1: Terminal -> Destination (Jeepney leg)
-    
     let fare = "N/A";
-    
-    // Check if we have the expected 2 legs from the waypoint routing
-    if (stats.legs && stats.legs.length >= 2) {
-        const jeepLeg = stats.legs[1]; // The second leg is the jeepney ride
-        fare = calculateJeepneyFare(jeepLeg.distance.value);
-    } else if (stats.legs && stats.legs.length === 1) {
-        // Fallback for some reason, calculate on total
-        fare = calculateJeepneyFare(stats.legs[0].distance.value);
+    let legsData: RouteLeg[] = [];
+
+    if (stats.legs) {
+        legsData = stats.legs.map((leg, index) => {
+            if (index === 0 || (stats.legs.length > 2 && index === stats.legs.length - 1)) {
+                return {
+                    ...leg,
+                    calculatedWalkingDuration: calculateWalkingTime(leg.distance.value)
+                };
+            }
+            return leg;
+        });
+    }
+
+    if (legsData.length >= 2) {
+        fare = calculateJeepneyFare(legsData[1].distance.value);
+    } else if (legsData.length === 1) {
+        fare = calculateJeepneyFare(legsData[0].distance.value);
     }
 
     setRouteStats({
         totalDistance: stats.totalDistance,
         totalDuration: stats.totalDuration,
         fare: fare,
-        legs: stats.legs
+        legs: legsData
     });
     setIsCalculating(false);
 
-    // Update Global Analytics
     updateGlobalStats(fare);
 
-    // --- SAVE TO HISTORY (If not Guest) ---
     if (user.role !== UserRole.GUEST) {
-        saveTripToHistory(stats.totalDistance, stats.totalDuration, fare);
+        saveTripToHistory(stats.totalDistance, stats.totalDuration, fare, legsData);
     }
   };
 
-  const saveTripToHistory = (distance: string, duration: string, fare: string) => {
+  const saveTripToHistory = (distance: string, duration: string, fare: string, legs: RouteLeg[]) => {
     const newHistoryItem: TripHistoryItem = {
         id: Date.now().toString(),
         origin: originInput === "Your Location" ? "My Location" : originInput,
@@ -564,26 +761,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
         time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
         totalDistance: distance,
         totalDuration: duration,
-        fare: fare
+        fare: fare,
+        legs: legs 
     };
 
-    const updatedHistory = [newHistoryItem, ...tripHistory].slice(0, 50); // Limit to 50 items
+    const updatedHistory = [newHistoryItem, ...tripHistory].slice(0, 50); 
     setTripHistory(updatedHistory);
-    localStorage.setItem(`commutewise_history_${user.username}`, JSON.stringify(updatedHistory));
-  };
-
-  const handleClearHistory = () => {
-    if (confirm("Are you sure you want to clear your trip history?")) {
-        setTripHistory([]);
-        localStorage.removeItem(`commutewise_history_${user.username}`);
-    }
+    // Use v2 key to effectively clear previous mock history
+    localStorage.setItem(`commutewise_history_v2_${user.username}`, JSON.stringify(updatedHistory));
   };
 
   const handleReuseHistory = (item: TripHistoryItem) => {
       setOriginInput(item.origin === "My Location" ? "Your Location" : item.origin);
       setDestinationInput(item.destination === "My Location" ? "Your Location" : item.destination);
+      setViewingHistoryItem(null); 
       setActiveTab('route');
-      // Optional: Auto-trigger calculation, but better to let user review first
   };
   
   const handleStartJourney = () => {
@@ -594,6 +786,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
      setIsNavigating(false);
      setRouteStats(null);
      setSearchTrigger(null);
+     setSelectedOriginCoords(null);
+     setSelectedDestinationCoords(null);
      setOriginInput('');
      setDestinationInput('');
      
@@ -608,7 +802,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     
     setIsSubmittingFeedback(true);
     
-    // Create new feedback item
     const newFeedback: FeedbackItem = {
       id: Date.now().toString(),
       type: feedbackType,
@@ -618,12 +811,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
       sender: user.username
     };
 
-    // Update state and local storage
     const updatedFeedbacks = [newFeedback, ...feedbacks];
     setFeedbacks(updatedFeedbacks);
     localStorage.setItem('commutewise_feedbacks', JSON.stringify(updatedFeedbacks));
     
-    // Simulate API delay
     setTimeout(() => {
       setIsSubmittingFeedback(false);
       setShowFeedbackModal(false);
@@ -633,80 +824,141 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     }, 1000);
   };
 
-  const handleResolveFeedback = (id: string) => {
+  const handleResolveFeedback = (id: string, reply: string) => {
     const updatedFeedbacks = feedbacks.map(f => 
-      f.id === id ? { ...f, status: 'resolved' as const } : f
+      f.id === id ? { ...f, status: 'resolved' as const, adminReply: reply } : f
     );
     setFeedbacks(updatedFeedbacks);
     localStorage.setItem('commutewise_feedbacks', JSON.stringify(updatedFeedbacks));
+    setReplyingToId(null);
+    setAdminReplyText('');
   };
 
   const isAdmin = user.role === UserRole.ADMIN;
 
-  // Admin Render Logic
+  const filteredFeedbacks = feedbacks.filter(f => {
+      if (feedbackFilter === 'all') return true;
+      return f.status === feedbackFilter;
+  });
+
   const renderAdminContent = () => {
     switch (activeAdminMenu) {
       case 'Dashboard':
         const pendingBugs = feedbacks.filter(f => f.type === 'bug' && f.status === 'pending').length;
-        const pendingSuggestions = feedbacks.filter(f => f.type === 'suggestion' && f.status === 'pending').length;
         return (
-          <div className="p-8 h-full overflow-y-auto">
-            <h2 className="text-2xl font-bold text-slate-800 mb-6">Overview</h2>
+          <div className="p-8 h-full overflow-y-auto bg-slate-50">
+            {/* Enhanced Admin Dashboard Header */}
+            <div className="mb-8 p-6 rounded-2xl bg-gradient-to-r from-slate-900 to-slate-800 text-white shadow-lg">
+                <h2 className="text-3xl font-bold mb-2">System Overview</h2>
+                <p className="text-slate-300">Welcome back, Admin. Here's what's happening today.</p>
+            </div>
+
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-                <div className="flex items-center gap-4">
-                  <div className="p-3 bg-blue-100 text-blue-600 rounded-xl">
+              {/* Card 1: Feedbacks */}
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 hover:shadow-md transition-shadow group">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="p-3 bg-blue-50 text-blue-600 rounded-xl group-hover:bg-blue-100 transition-colors">
                     <MessageSquare className="w-6 h-6" />
                   </div>
-                  <div>
-                    <p className="text-sm text-slate-500 font-medium">Total Feedback</p>
-                    <h3 className="text-2xl font-bold text-slate-800">{feedbacks.length}</h3>
-                  </div>
+                  <span className="text-xs font-bold text-slate-400 uppercase">Reports</span>
                 </div>
+                <h3 className="text-4xl font-bold text-slate-800 mb-1">{feedbacks.length}</h3>
+                <p className="text-sm text-slate-500">Total feedbacks received</p>
               </div>
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-                <div className="flex items-center gap-4">
-                  <div className="p-3 bg-red-100 text-red-600 rounded-xl">
+
+              {/* Card 2: Pending Issues */}
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 hover:shadow-md transition-shadow group">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="p-3 bg-red-50 text-red-600 rounded-xl group-hover:bg-red-100 transition-colors">
                     <Bug className="w-6 h-6" />
                   </div>
-                  <div>
-                    <p className="text-sm text-slate-500 font-medium">Pending Bugs</p>
-                    <h3 className="text-2xl font-bold text-slate-800">{pendingBugs}</h3>
-                  </div>
+                  <span className="text-xs font-bold text-slate-400 uppercase">Action Needed</span>
                 </div>
+                <h3 className="text-4xl font-bold text-slate-800 mb-1">{pendingBugs}</h3>
+                <p className="text-sm text-slate-500">Pending bug reports</p>
               </div>
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-                <div className="flex items-center gap-4">
-                  <div className="p-3 bg-green-100 text-green-600 rounded-xl">
-                    <CheckCircle className="w-6 h-6" />
+
+              {/* Card 3: System Status */}
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 hover:shadow-md transition-shadow group">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="p-3 bg-green-50 text-green-600 rounded-xl group-hover:bg-green-100 transition-colors">
+                    <Activity className="w-6 h-6" />
                   </div>
-                  <div>
-                    <p className="text-sm text-slate-500 font-medium">Resolved Issues</p>
-                    <h3 className="text-2xl font-bold text-slate-800">{feedbacks.filter(f => f.status === 'resolved').length}</h3>
-                  </div>
+                  <span className="text-xs font-bold text-slate-400 uppercase">Status</span>
                 </div>
+                <div className="flex items-center gap-2 mb-1">
+                    <div className="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
+                    <h3 className="text-xl font-bold text-slate-800">Operational</h3>
+                </div>
+                <p className="text-sm text-slate-500">All systems normal</p>
               </div>
             </div>
 
-            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-              <h3 className="font-bold text-slate-800 mb-4">Recent Activity</h3>
-              <div className="space-y-4">
-                {feedbacks.slice(0, 5).map(f => (
-                  <div key={f.id} className="flex items-center justify-between py-2 border-b border-slate-50 last:border-0">
-                    <div className="flex items-center gap-3">
-                      <div className={`w-2 h-2 rounded-full ${f.type === 'bug' ? 'bg-red-500' : 'bg-blue-500'}`}></div>
-                      <div>
-                        <p className="text-sm font-medium text-slate-800">{f.sender} submitted a {f.type}</p>
-                        <p className="text-xs text-slate-400">{f.date}</p>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Recent Activity */}
+                <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+                  <h3 className="font-bold text-slate-800 mb-6 flex items-center gap-2">
+                      <Clock className="w-5 h-5 text-slate-400" /> Recent Activity
+                  </h3>
+                  <div className="space-y-4">
+                    {feedbacks.slice(0, 5).map(f => (
+                      <div key={f.id} className="flex items-center justify-between py-3 border-b border-slate-50 last:border-0 hover:bg-slate-50 rounded-lg px-2 transition-colors">
+                        <div className="flex items-center gap-4">
+                          <div className={`w-2 h-2 rounded-full ${f.type === 'bug' ? 'bg-red-500' : 'bg-blue-500'}`}></div>
+                          <div>
+                            <p className="text-sm font-medium text-slate-800">{f.sender} submitted a {f.type}</p>
+                            <p className="text-xs text-slate-400">{f.date}</p>
+                          </div>
+                        </div>
+                        <span className={`px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider ${f.status === 'resolved' ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-600'}`}>
+                          {f.status}
+                        </span>
                       </div>
-                    </div>
-                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${f.status === 'resolved' ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-600'}`}>
-                      {f.status}
-                    </span>
+                    ))}
+                    {feedbacks.length === 0 && <p className="text-slate-400 text-sm italic">No recent activity recorded.</p>}
                   </div>
-                ))}
-                {feedbacks.length === 0 && <p className="text-slate-400 text-sm">No activity yet.</p>}
-              </div>
+                </div>
+
+                {/* Quick Actions */}
+                <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+                    <h3 className="font-bold text-slate-800 mb-6 flex items-center gap-2">
+                        <Zap className="w-5 h-5 text-yellow-500" /> Quick Actions
+                    </h3>
+                    <div className="grid grid-cols-2 gap-4">
+                        <button 
+                            onClick={() => setActiveAdminMenu('Route Management')}
+                            className="p-4 rounded-xl border border-slate-200 hover:border-blue-500 hover:bg-blue-50 transition-all text-left group"
+                        >
+                            <Map className="w-6 h-6 text-slate-400 group-hover:text-blue-600 mb-2 transition-colors" />
+                            <p className="font-bold text-slate-700 group-hover:text-blue-700">Manage Routes</p>
+                            <p className="text-xs text-slate-400">Edit stops & paths</p>
+                        </button>
+                        <button 
+                            onClick={() => setActiveAdminMenu('Fares')}
+                            className="p-4 rounded-xl border border-slate-200 hover:border-green-500 hover:bg-green-50 transition-all text-left group"
+                        >
+                            <DollarSign className="w-6 h-6 text-slate-400 group-hover:text-green-600 mb-2 transition-colors" />
+                            <p className="font-bold text-slate-700 group-hover:text-green-700">Update Fares</p>
+                            <p className="text-xs text-slate-400">Adjust pricing matrix</p>
+                        </button>
+                        <button 
+                            onClick={() => setActiveAdminMenu('Feedbacks')}
+                            className="p-4 rounded-xl border border-slate-200 hover:border-orange-500 hover:bg-orange-50 transition-all text-left group"
+                        >
+                            <MessageSquare className="w-6 h-6 text-slate-400 group-hover:text-orange-600 mb-2 transition-colors" />
+                            <p className="font-bold text-slate-700 group-hover:text-orange-700">Check Reports</p>
+                            <p className="text-xs text-slate-400">View user feedback</p>
+                        </button>
+                        <button 
+                            onClick={() => setActiveAdminMenu('Analytic Reports')}
+                            className="p-4 rounded-xl border border-slate-200 hover:border-purple-500 hover:bg-purple-50 transition-all text-left group"
+                        >
+                            <BarChart3 className="w-6 h-6 text-slate-400 group-hover:text-purple-600 mb-2 transition-colors" />
+                            <p className="font-bold text-slate-700 group-hover:text-purple-700">View Analytics</p>
+                            <p className="text-xs text-slate-400">See performance data</p>
+                        </button>
+                    </div>
+                </div>
             </div>
           </div>
         );
@@ -714,16 +966,39 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
       case 'Feedbacks':
         return (
           <div className="p-8 h-full overflow-y-auto">
-            <h2 className="text-2xl font-bold text-slate-800 mb-6">User Feedbacks</h2>
+            <div className="flex justify-between items-center mb-6">
+                <h2 className="text-2xl font-bold text-slate-800">User Feedbacks</h2>
+                <div className="flex items-center gap-2 bg-white p-1 rounded-lg border border-slate-200">
+                    <button 
+                      onClick={() => setFeedbackFilter('all')}
+                      className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${feedbackFilter === 'all' ? 'bg-slate-100 text-slate-800 font-bold' : 'text-slate-500 hover:bg-slate-50'}`}
+                    >
+                      All
+                    </button>
+                    <button 
+                      onClick={() => setFeedbackFilter('pending')}
+                      className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${feedbackFilter === 'pending' ? 'bg-orange-100 text-orange-700 font-bold' : 'text-slate-500 hover:bg-slate-50'}`}
+                    >
+                      Pending
+                    </button>
+                    <button 
+                      onClick={() => setFeedbackFilter('resolved')}
+                      className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${feedbackFilter === 'resolved' ? 'bg-green-100 text-green-700 font-bold' : 'text-slate-500 hover:bg-slate-50'}`}
+                    >
+                      Resolved
+                    </button>
+                </div>
+            </div>
+            
             <div className="space-y-4">
-              {feedbacks.length === 0 ? (
+              {filteredFeedbacks.length === 0 ? (
                 <div className="text-center py-12 bg-white rounded-2xl border border-slate-200 border-dashed">
                   <MessageSquare className="w-12 h-12 text-slate-300 mx-auto mb-3" />
-                  <p className="text-slate-500">No feedbacks received yet.</p>
+                  <p className="text-slate-500">No feedbacks found.</p>
                 </div>
               ) : (
-                feedbacks.map(f => (
-                  <div key={f.id} className={`bg-white p-6 rounded-2xl shadow-sm border transition-all ${f.status === 'pending' ? 'border-l-4 border-l-blue-500 border-y-slate-200 border-r-slate-200' : 'border-slate-200 opacity-75'}`}>
+                filteredFeedbacks.map(f => (
+                  <div key={f.id} className={`bg-white p-6 rounded-2xl shadow-sm border transition-all ${f.status === 'pending' ? 'border-l-4 border-l-orange-500 border-y-slate-200 border-r-slate-200' : 'border-l-4 border-l-green-500 border-y-slate-200 border-r-slate-200'}`}>
                     <div className="flex justify-between items-start mb-3">
                       <div className="flex items-center gap-3">
                         <span className={`px-2.5 py-0.5 rounded-md text-xs font-bold uppercase tracking-wide ${f.type === 'bug' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}`}>
@@ -736,21 +1011,60 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                            by {f.sender}
                         </span>
                       </div>
-                      {f.status === 'pending' && (
-                        <button 
-                          onClick={() => handleResolveFeedback(f.id)}
-                          className="flex items-center gap-1 text-xs font-medium bg-green-50 text-green-700 px-3 py-1.5 rounded-lg hover:bg-green-100 transition-colors border border-green-200"
-                        >
-                          <CheckSquare className="w-3 h-3" /> Mark Resolved
-                        </button>
-                      )}
                       {f.status === 'resolved' && (
-                        <span className="flex items-center gap-1 text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded">
+                        <span className="flex items-center gap-1 text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded border border-green-100">
                            <CheckCircle className="w-3 h-3" /> Resolved
                         </span>
                       )}
                     </div>
-                    <p className="text-slate-700 text-sm leading-relaxed">{f.description}</p>
+                    
+                    <p className="text-slate-700 text-sm leading-relaxed mb-4">{f.description}</p>
+                    
+                    {/* Admin Reply Section */}
+                    {f.status === 'pending' ? (
+                        <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
+                            {replyingToId === f.id ? (
+                                <div className="space-y-3">
+                                    <textarea 
+                                        value={adminReplyText}
+                                        onChange={(e) => setAdminReplyText(e.target.value)}
+                                        className="w-full p-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-green-500 outline-none"
+                                        placeholder="Type your reply or resolution note..."
+                                        rows={2}
+                                        autoFocus
+                                    ></textarea>
+                                    <div className="flex gap-2 justify-end">
+                                        <button 
+                                            onClick={() => { setReplyingToId(null); setAdminReplyText(''); }}
+                                            className="text-xs font-bold text-slate-500 px-3 py-1.5 hover:bg-slate-200 rounded-lg"
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button 
+                                            onClick={() => handleResolveFeedback(f.id, adminReplyText)}
+                                            className="text-xs font-bold bg-green-600 text-white px-3 py-1.5 rounded-lg hover:bg-green-700 flex items-center gap-1"
+                                        >
+                                            <CheckCircle className="w-3 h-3" /> Reply & Resolve
+                                        </button>
+                                    </div>
+                                </div>
+                            ) : (
+                                <button 
+                                  onClick={() => { setReplyingToId(f.id); setAdminReplyText(''); }}
+                                  className="w-full flex items-center justify-center gap-2 text-sm font-medium text-slate-600 hover:text-green-600 transition-colors py-2 rounded-lg hover:bg-green-50"
+                                >
+                                  <MessageCircle className="w-4 h-4" /> Add Reply & Resolve
+                                </button>
+                            )}
+                        </div>
+                    ) : (
+                        f.adminReply && (
+                            <div className="mt-3 pl-4 border-l-2 border-green-200 bg-green-50/50 p-3 rounded-r-xl">
+                                <p className="text-xs font-bold text-green-800 mb-1">Admin Response</p>
+                                <p className="text-sm text-slate-600">{f.adminReply}</p>
+                            </div>
+                        )
+                    )}
                   </div>
                 ))
               )}
@@ -759,9 +1073,39 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
         );
 
       case 'Analytic Reports':
-        // Calculate dynamic top location
-        const topLoc = Object.entries(globalStats.topLocations)
-           .sort((a, b) => b[1] - a[1])[0];
+        // Real Data Calculations
+        // 1. Top Destinations (sorted by frequency)
+        const sortedLocations = Object.entries(globalStats.topLocations)
+            .sort(([,a], [,b]) => (b as number) - (a as number))
+            .slice(0, 5); // Top 5
+        
+        const maxLocCount = (sortedLocations[0]?.[1] as number) || 1;
+        
+        const topDestinations = sortedLocations.map(([name, count]) => ({
+            name,
+            count: count as number,
+            percent: ((count as number) / maxLocCount) * 100
+        }));
+
+        // 2. Peak Hours (0-23 hours bucket)
+        const timeSlots = [6, 9, 12, 15, 18, 21];
+        const values = Object.values(globalStats.hourlyActivity) as number[];
+        const maxActivity = Math.max(...values, 1);
+        
+        const peakHoursData = timeSlots.map(hour => {
+            const count = globalStats.hourlyActivity[hour] || 0;
+            const label = hour > 12 ? `${hour - 12}PM` : hour === 12 ? '12PM' : `${hour}AM`;
+            return {
+                label,
+                value: count,
+                height: `${(count / maxActivity) * 100}%`
+            };
+        });
+
+        // 3. Satisfaction Rate
+        const resolvedCount = feedbacks.filter(f => f.status === 'resolved').length;
+        const totalFeedbacks = feedbacks.length || 1;
+        const satisfactionRate = feedbacks.length === 0 ? 100 : Math.round((resolvedCount / totalFeedbacks) * 100);
 
         return (
           <div className="p-8 h-full overflow-y-auto bg-slate-50">
@@ -769,26 +1113,25 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
             <div className="flex flex-col md:flex-row md:items-center justify-between mb-8">
               <div>
                 <h2 className="text-2xl font-bold text-slate-800">Analytic Reports</h2>
-                <p className="text-slate-500 text-sm mt-1">Real-time data from user interactions</p>
+                <p className="text-slate-500 text-sm mt-1">Operational insights and real-time metrics</p>
               </div>
               <div className="flex items-center gap-3 mt-4 md:mt-0">
                 <button 
                   onClick={handleResetAnalytics}
-                  className="p-2 bg-white border border-red-200 text-red-600 rounded-lg hover:bg-red-50 transition-colors text-xs font-bold"
-                  title="Reset Data"
+                  className="p-2 bg-white border border-red-200 text-red-600 rounded-lg hover:bg-red-50 transition-colors text-xs font-bold flex items-center gap-2"
                 >
-                  <RefreshCw className="w-4 h-4" /> Reset
+                  <RefreshCw className="w-4 h-4" /> Reset Data
                 </button>
                 <div className="bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-medium shadow-sm flex items-center gap-2">
-                  <CheckCircle className="w-4 h-4" /> Live
+                  <Activity className="w-4 h-4" /> Live System
                 </div>
               </div>
             </div>
       
-            {/* Metric Cards Grid */}
+            {/* Metric Cards Grid - Expanded */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
               {/* Total Searches */}
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 hover:border-blue-300 transition-colors">
                  <div className="flex justify-between items-start mb-4">
                     <div>
                        <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wide">Total Searches</p>
@@ -798,13 +1141,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                        <BarChart3 className="w-5 h-5" />
                     </div>
                  </div>
-                 <p className="text-slate-400 text-xs font-medium">
-                    Route calculations processed
-                 </p>
+                 <div className="flex items-center gap-1 text-green-600 text-xs font-bold">
+                    <TrendingUp className="w-3 h-3" /> Real-time Count
+                 </div>
               </div>
       
               {/* Est. Revenue */}
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 hover:border-green-300 transition-colors">
                  <div className="flex justify-between items-start mb-4">
                     <div>
                        <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wide">Est. Revenue</p>
@@ -814,184 +1157,272 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                        <DollarSign className="w-5 h-5" />
                     </div>
                  </div>
-                 <p className="text-slate-400 text-xs">Total fare value calculated</p>
+                 <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2">
+                    <div className="bg-green-500 h-1.5 rounded-full" style={{ width: '100%' }}></div>
+                 </div>
+                 <p className="text-xs text-slate-400 mt-2">Accumulated Value</p>
               </div>
       
-              {/* Top Location */}
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 col-span-2">
+              {/* User Satisfaction */}
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 hover:border-orange-300 transition-colors">
                  <div className="flex justify-between items-start mb-4">
                     <div>
-                       <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wide">Top Destination</p>
-                       <h3 className="text-lg font-bold text-slate-800 mt-2 leading-tight">
-                         {topLoc ? topLoc[0] : 'N/A'}
-                       </h3>
+                       <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wide">User Satisfaction</p>
+                       <h3 className="text-3xl font-bold text-slate-800 mt-2">{satisfactionRate}%</h3>
                     </div>
-                    <div className="p-3 bg-purple-50 text-purple-600 rounded-xl">
-                       <MapPin className="w-5 h-5" />
+                    <div className="p-3 bg-orange-50 text-orange-600 rounded-xl">
+                       <ThumbsUp className="w-5 h-5" />
                     </div>
                  </div>
-                 <p className="text-slate-400 text-xs">Most searched destination ({topLoc ? topLoc[1] : 0} times)</p>
+                 <p className="text-xs text-slate-400">Based on resolved tickets</p>
+              </div>
+
+              {/* Active Routes */}
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 hover:border-purple-300 transition-colors">
+                 <div className="flex justify-between items-start mb-4">
+                    <div>
+                       <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wide">Active Routes</p>
+                       <h3 className="text-3xl font-bold text-slate-800 mt-2">{routes.length}</h3>
+                    </div>
+                    <div className="p-3 bg-purple-50 text-purple-600 rounded-xl">
+                       <Route className="w-5 h-5" />
+                    </div>
+                 </div>
+                 <p className="text-xs text-slate-400">{routes.reduce((acc, r) => acc + r.stops.length, 0)} total stops active</p>
               </div>
             </div>
-      
-            {/* Charts Grid */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-               {/* Demo Chart */}
-               <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-                  <h4 className="font-bold text-slate-700 mb-6 flex items-center gap-2 text-sm">
-                     <Clock className="w-4 h-4 text-green-600" /> Hourly Activity (Mock)
-                  </h4>
-                  <div className="h-64 w-full relative opacity-50 pointer-events-none grayscale">
-                     <svg viewBox="0 0 400 200" className="w-full h-full overflow-visible">
-                        {[0, 45, 90, 135, 180].map((val, i) => (
-                          <line key={i} x1="30" y1={200 - (i * 40)} x2="400" y2={200 - (i * 40)} stroke="#f1f5f9" strokeDasharray="4" />
+
+            {/* Visual Analytics Row */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+                
+                {/* Peak Hours Chart */}
+                <div className="lg:col-span-2 bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                    <div className="flex justify-between items-center mb-6">
+                        <h4 className="font-bold text-slate-800 flex items-center gap-2">
+                            <Clock className="w-5 h-5 text-blue-600" />
+                            Activity by Hour (Today)
+                        </h4>
+                        <span className="text-xs text-slate-400">User Searches</span>
+                    </div>
+                    <div className="h-48 flex items-end gap-2 sm:gap-6 justify-center px-4">
+                        {peakHoursData.map((d, i) => (
+                            <div key={i} className="flex flex-col items-center gap-2 group w-full">
+                                <div className="w-full bg-blue-50/50 rounded-t-lg relative h-40 flex items-end hover:bg-blue-100 transition-colors">
+                                    <div 
+                                        style={{ height: d.value === 0 ? '4px' : d.height }} 
+                                        className={`w-full rounded-t-lg relative transition-all duration-500 ${d.value === 0 ? 'bg-slate-200' : 'bg-blue-500 group-hover:bg-blue-600'}`}
+                                    >
+                                        <div className="absolute -top-8 left-1/2 -translate-x-1/2 bg-slate-800 text-white text-[10px] py-1 px-2 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap z-10">
+                                            {d.value} searches
+                                        </div>
+                                    </div>
+                                </div>
+                                <span className="text-xs font-bold text-slate-500">{d.label}</span>
+                            </div>
                         ))}
-                        <polyline 
-                           points="30,150 80,120 130,111 180,88 230,111 280,77 330,60 380,144"
-                           fill="none"
-                           stroke="#16a34a"
-                           strokeWidth="2.5"
-                           strokeLinecap="round"
-                           strokeLinejoin="round"
-                        />
-                     </svg>
-                     <div className="absolute inset-0 flex items-center justify-center text-xs font-bold text-slate-400">
-                        Visual placeholder
-                     </div>
-                  </div>
-               </div>
+                    </div>
+                    {peakHoursData.every(d => d.value === 0) && (
+                        <p className="text-center text-xs text-slate-400 mt-2">No activity recorded yet for these time slots.</p>
+                    )}
+                </div>
+
+                {/* Top Destinations List */}
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                    <h4 className="font-bold text-slate-800 mb-6 flex items-center gap-2">
+                        <MapPin className="w-5 h-5 text-red-500" />
+                        Top Destinations
+                    </h4>
+                    <div className="space-y-5">
+                        {topDestinations.map((dest, i) => (
+                            <div key={i}>
+                                <div className="flex justify-between text-sm mb-1">
+                                    <span className="font-medium text-slate-700 truncate max-w-[150px]">{dest.name}</span>
+                                    <span className="font-bold text-slate-900">{dest.count}</span>
+                                </div>
+                                <div className="w-full bg-slate-100 rounded-full h-2">
+                                    <div 
+                                        className={`h-2 rounded-full ${i === 0 ? 'bg-red-500' : 'bg-slate-400'}`} 
+                                        style={{ width: `${dest.percent}%` }}
+                                    ></div>
+                                </div>
+                            </div>
+                        ))}
+                        {topDestinations.length === 0 && <p className="text-sm text-slate-400 italic text-center py-10">No search data available yet.</p>}
+                    </div>
+                </div>
             </div>
           </div>
         );
 
-      case 'Routes': 
+      case 'Route Management': 
         return (
-            <div className="p-8 h-full overflow-y-auto bg-slate-50">
-               <h2 className="text-2xl font-bold text-slate-800 mb-6">Route Management</h2>
-               <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-                   <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
-                       <span className="font-bold text-slate-700">Active Routes</span>
-                       <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded font-bold">1 Active</span>
+            <div className="p-8 h-full overflow-y-auto bg-slate-50 flex flex-col">
+               <div className="flex justify-between items-center mb-6 shrink-0">
+                   <h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
+                       <Map className="w-6 h-6 text-blue-600" />
+                       Route Management
+                   </h2>
+                   <div className="flex gap-2">
+                       {/* Dropdown for Routes */}
+                       <select 
+                          value={selectedAdminRouteId}
+                          onChange={(e) => setSelectedAdminRouteId(e.target.value)}
+                          className="bg-white border border-slate-300 text-slate-700 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2.5 font-bold"
+                       >
+                           {routes.map(r => (
+                               <option key={r.id} value={r.id}>{r.name}</option>
+                           ))}
+                       </select>
+                       
+                       <button 
+                         onClick={handleAddRoute}
+                         className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors shadow-sm"
+                       >
+                          <Plus className="w-4 h-4" /> New Route
+                       </button>
                    </div>
-                   <div className="p-6">
-                       <div className="flex items-center gap-4 mb-4">
-                           <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center text-blue-600">
-                               <Route className="w-6 h-6" />
-                           </div>
-                           <div>
-                               <h3 className="font-bold text-slate-800">Tandang Sora - Maharlika</h3>
-                               <p className="text-sm text-slate-500">Standard Jeepney Route • {ROUTE_PATH.length} path segments</p>
-                           </div>
-                           <div className="ml-auto">
-                               <button 
-                                 onClick={() => setShowRouteDetails(!showRouteDetails)}
-                                 className="text-sm text-blue-600 font-medium hover:underline"
-                               >
-                                 {showRouteDetails ? 'Hide Details' : 'View Details'}
-                               </button>
+               </div>
+
+               <div className="flex-1 flex gap-6 overflow-hidden">
+                   {/* Left: Stops List & Config */}
+                   <div className="w-96 bg-white rounded-2xl shadow-sm border border-slate-200 flex flex-col overflow-hidden">
+                       <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                           <h3 className="font-bold text-slate-700">Stops & Terminals</h3>
+                           <button 
+                             onClick={handleStartAddStop}
+                             disabled={adminMapMode !== 'view'}
+                             className={`text-xs px-2 py-1 rounded font-bold transition-colors flex items-center gap-1 ${adminMapMode === 'add_stop' ? 'bg-orange-100 text-orange-700 border border-orange-200' : 'bg-green-100 text-green-700 hover:bg-green-200'}`}
+                           >
+                              <Plus className="w-3 h-3" /> {adminMapMode === 'add_stop' ? 'Click Map...' : 'Add Stop'}
+                           </button>
+                       </div>
+                       
+                       <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                           {activeAdminRoute.stops.map((stop) => (
+                               <div key={stop.id} className={`p-3 rounded-xl border transition-all hover:shadow-sm ${stop.isTerminal ? 'bg-orange-50 border-orange-100' : 'bg-white border-slate-100'}`}>
+                                   <div className="flex items-start gap-3">
+                                       <div className={`p-1.5 rounded-full mt-0.5 ${stop.isTerminal ? 'bg-orange-200 text-orange-700' : 'bg-blue-100 text-blue-600'}`}>
+                                           {stop.isTerminal ? <Warehouse className="w-4 h-4" /> : <MapPin className="w-4 h-4" />}
+                                       </div>
+                                       
+                                       <div className="flex-1">
+                                           {editingStopId === stop.id ? (
+                                               <div className="space-y-2">
+                                                   <input 
+                                                     type="text" 
+                                                     value={tempStopData.name}
+                                                     onChange={(e) => setTempStopData({...tempStopData, name: e.target.value})}
+                                                     className="w-full p-1.5 border border-slate-300 rounded text-sm font-bold"
+                                                     placeholder="Name"
+                                                   />
+                                                   <input 
+                                                     type="text" 
+                                                     value={tempStopData.description}
+                                                     onChange={(e) => setTempStopData({...tempStopData, description: e.target.value})}
+                                                     className="w-full p-1.5 border border-slate-300 rounded text-xs"
+                                                     placeholder="Desc"
+                                                   />
+                                                   <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                                                       <input 
+                                                         type="checkbox"
+                                                         checked={tempStopData.isTerminal}
+                                                         onChange={(e) => setTempStopData({...tempStopData, isTerminal: e.target.checked})}
+                                                       />
+                                                       Is Terminal?
+                                                   </label>
+                                                   <div className="flex gap-2 justify-end mt-1">
+                                                       <button onClick={() => setEditingStopId(null)} className="text-xs text-slate-500 px-2">Cancel</button>
+                                                       <button onClick={() => handleSaveStop(stop.id)} className="text-xs bg-green-600 text-white px-2 py-1 rounded">Save</button>
+                                                   </div>
+                                               </div>
+                                           ) : (
+                                               <>
+                                                   <div className="flex justify-between items-start">
+                                                       <h4 className="font-bold text-slate-800 text-sm">{stop.name}</h4>
+                                                       <div className="flex gap-1">
+                                                           <button onClick={() => handleLocateStop(stop.coords)} className="text-slate-400 hover:text-blue-500"><Crosshair className="w-3 h-3" /></button>
+                                                           <button onClick={() => handleEditStop(stop)} className="text-slate-400 hover:text-blue-500"><Edit2 className="w-3 h-3" /></button>
+                                                           <button onClick={() => handleDeleteStop(stop.id)} className="text-slate-400 hover:text-red-500"><Trash2 className="w-3 h-3" /></button>
+                                                       </div>
+                                                   </div>
+                                                   <p className="text-xs text-slate-500 line-clamp-1">{stop.description}</p>
+                                                   {stop.isTerminal && (
+                                                       <span className="inline-block mt-1 text-[10px] bg-orange-200 text-orange-800 px-1.5 rounded font-bold uppercase">Terminal</span>
+                                                   )}
+                                               </>
+                                           )}
+                                       </div>
+                                   </div>
+                               </div>
+                           ))}
+                       </div>
+                   </div>
+
+                   {/* Right: Map Preview with Editing Controls */}
+                   <div className="flex-1 bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden flex flex-col relative">
+                       <div className="p-3 bg-slate-50 border-b border-slate-100 flex justify-between items-center relative z-10">
+                           <span className="text-xs font-bold text-slate-500 uppercase tracking-wide">Route Map Visualization</span>
+                           
+                           {/* Route Path Controls */}
+                           <div className="flex items-center gap-2">
+                               {adminMapMode === 'edit_path' ? (
+                                   <>
+                                      <span className="text-xs font-bold text-orange-600 animate-pulse mr-2">Click map to add points</span>
+                                      <button 
+                                        onClick={handleUndoPathPoint}
+                                        className="text-xs bg-slate-200 text-slate-700 px-2 py-1 rounded font-medium hover:bg-slate-300 flex items-center gap-1"
+                                      >
+                                         <Undo className="w-3 h-3" /> Undo
+                                      </button>
+                                      <button 
+                                        onClick={handleClearPath}
+                                        className="text-xs bg-red-100 text-red-600 px-2 py-1 rounded font-medium hover:bg-red-200 flex items-center gap-1"
+                                      >
+                                         <Eraser className="w-3 h-3" /> Clear
+                                      </button>
+                                      <button 
+                                        onClick={() => setAdminMapMode('view')}
+                                        className="text-xs bg-green-600 text-white px-3 py-1 rounded font-bold hover:bg-green-700 flex items-center gap-1"
+                                      >
+                                         <CheckCircle className="w-3 h-3" /> Done
+                                      </button>
+                                   </>
+                               ) : (
+                                   <>
+                                      <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded font-medium">{activeAdminRoute.path.length} Path Points</span>
+                                      <button 
+                                        onClick={() => setAdminMapMode('edit_path')}
+                                        disabled={adminMapMode === 'add_stop'}
+                                        className="text-xs border border-blue-200 text-blue-600 px-2 py-1 rounded font-medium hover:bg-blue-50 flex items-center gap-1"
+                                      >
+                                         <Edit2 className="w-3 h-3" /> Edit Path
+                                      </button>
+                                   </>
+                               )}
                            </div>
                        </div>
                        
-                       {/* Expanded Route Details */}
-                       {showRouteDetails && (
-                           <div className="mt-4 pt-4 border-t border-slate-100 space-y-2 animate-in fade-in slide-in-from-top-2">
-                               <p className="text-xs font-bold text-slate-400 uppercase tracking-wide mb-2">Route Segments (Path)</p>
-                               <div className="bg-slate-50 rounded-lg p-3 max-h-60 overflow-y-auto text-xs font-mono text-slate-600 space-y-1">
-                                   {ROUTE_PATH.map((point, i) => (
-                                       <div key={i} className="flex gap-4">
-                                           <span className="text-slate-400 w-6">#{i+1}</span>
-                                           <span>Lat: {point.lat.toFixed(5)}, Lng: {point.lng.toFixed(5)}</span>
-                                       </div>
-                                   ))}
-                               </div>
+                       {/* Map Banner for modes */}
+                       {adminMapMode === 'add_stop' && (
+                           <div className="absolute top-14 left-1/2 -translate-x-1/2 z-20 bg-orange-500 text-white px-4 py-2 rounded-full shadow-lg text-xs font-bold flex items-center gap-2 animate-bounce">
+                               <MapPin className="w-4 h-4" /> Click map to place new stop
+                               <button onClick={() => setAdminMapMode('view')} className="ml-2 bg-white/20 rounded-full p-0.5 hover:bg-white/40"><X className="w-3 h-3"/></button>
                            </div>
                        )}
-                   </div>
-               </div>
-            </div>
-        );
 
-      case 'Terminals':
-        return (
-            <div className="p-8 h-full overflow-y-auto bg-slate-50">
-               <div className="flex justify-between items-center mb-6">
-                   <h2 className="text-2xl font-bold text-slate-800">Terminal & Stops</h2>
-                   <button 
-                     onClick={handleAddStop}
-                     className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors"
-                   >
-                      <Plus className="w-4 h-4" /> Add Stop
-                   </button>
-               </div>
-               
-               <div className="grid gap-4">
-                   {stops.map((stop) => (
-                       <div key={stop.id} className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex items-start gap-4 group">
-                           <div className="bg-orange-100 p-2 rounded-lg text-orange-600 mt-1">
-                               <MapPin className="w-5 h-5" />
-                           </div>
-                           <div className="flex-1">
-                               {editingStopId === stop.id ? (
-                                   <div className="space-y-2 mb-2">
-                                       <input 
-                                         type="text" 
-                                         value={tempStopData.name}
-                                         onChange={(e) => setTempStopData({...tempStopData, name: e.target.value})}
-                                         className="w-full p-2 border border-slate-300 rounded text-sm font-bold"
-                                         placeholder="Stop Name"
-                                       />
-                                       <textarea 
-                                         value={tempStopData.description}
-                                         onChange={(e) => setTempStopData({...tempStopData, description: e.target.value})}
-                                         className="w-full p-2 border border-slate-300 rounded text-xs"
-                                         placeholder="Description"
-                                         rows={2}
-                                       />
-                                       <div className="flex gap-2 justify-end">
-                                           <button onClick={() => setEditingStopId(null)} className="text-xs text-slate-500 px-2 py-1">Cancel</button>
-                                           <button onClick={() => handleSaveStop(stop.id)} className="text-xs bg-green-600 text-white px-3 py-1 rounded">Save</button>
-                                       </div>
-                                   </div>
-                               ) : (
-                                   <>
-                                       <h4 className="font-bold text-slate-800">{stop.name}</h4>
-                                       <p className="text-sm text-slate-500">{stop.description}</p>
-                                       <div className="mt-2 flex gap-2 text-xs font-mono text-slate-400">
-                                           <span className="bg-slate-50 px-2 py-1 rounded border border-slate-100">Lat: {stop.coords.lat.toFixed(4)}</span>
-                                           <span className="bg-slate-50 px-2 py-1 rounded border border-slate-100">Lng: {stop.coords.lng.toFixed(4)}</span>
-                                       </div>
-                                   </>
-                               )}
-                           </div>
-                           <div className="flex flex-col gap-1 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
-                               {editingStopId !== stop.id && (
-                                   <>
-                                       <button 
-                                         onClick={() => handleLocateStop(stop.coords)}
-                                         className="p-1.5 text-blue-500 hover:bg-blue-50 rounded" 
-                                         title="Locate on Map"
-                                       >
-                                           <ArrowUpRight className="w-4 h-4" />
-                                       </button>
-                                       <button 
-                                         onClick={() => handleEditStop(stop)}
-                                         className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-slate-50 rounded"
-                                         title="Edit"
-                                       >
-                                           <Edit2 className="w-4 h-4" />
-                                       </button>
-                                       <button 
-                                         onClick={() => handleDeleteStop(stop.id)}
-                                         className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded"
-                                         title="Delete"
-                                       >
-                                           <Trash2 className="w-4 h-4" />
-                                       </button>
-                                   </>
-                               )}
-                           </div>
+                       <div className="flex-1 relative">
+                           {/* Using MapWithRoute but with specific props for admin view */}
+                           <MapWithRoute 
+                               userLocation={null}
+                               routePath={activeAdminRoute.path}
+                               stops={activeAdminRoute.stops}
+                               focusedLocation={focusedLocation}
+                               onMapClick={handleMapClick}
+                               selectionMode={adminMapMode === 'add_stop' ? 'destination' : adminMapMode === 'edit_path' ? 'origin' : null} 
+                               searchRoute={null} 
+                           />
                        </div>
-                   ))}
+                   </div>
                </div>
             </div>
         );
@@ -1032,13 +1463,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                           <thead className="bg-slate-50 border-b border-slate-100">
                               <tr>
                                   <th className="p-4 font-bold text-slate-600">Metric</th>
-                                  <th className="p-4 font-bold text-slate-600">Value (PHP)</th>
+                                  <th className="p-4 font-bold text-slate-600">Value</th>
                                   <th className="p-4 font-bold text-slate-600">Description</th>
                               </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100">
                               <tr>
-                                  <td className="p-4 font-medium text-slate-800">Base Fare</td>
+                                  <td className="p-4 font-medium text-slate-800">Base Fare (PHP)</td>
                                   <td className="p-4">
                                      {isEditingFare ? (
                                         <input 
@@ -1056,7 +1487,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                   </td>
                               </tr>
                               <tr>
-                                  <td className="p-4 font-medium text-slate-800">Succeeding Rate</td>
+                                  <td className="p-4 font-medium text-slate-800">Succeeding Rate (PHP)</td>
                                   <td className="p-4">
                                      {isEditingFare ? (
                                         <input 
@@ -1072,7 +1503,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                   <td className="p-4 text-slate-500">Add-on cost per kilometer</td>
                               </tr>
                               <tr>
-                                  <td className="p-4 font-medium text-slate-800">Base Distance</td>
+                                  <td className="p-4 font-medium text-slate-800">Base Distance (km)</td>
                                   <td className="p-4">
                                      {isEditingFare ? (
                                         <div className="flex items-center gap-2">
@@ -1090,6 +1521,25 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                   </td>
                                   <td className="p-4 text-slate-500">Distance covered by base fare</td>
                               </tr>
+                              <tr>
+                                  <td className="p-4 font-medium text-slate-800">Discount Rate (%)</td>
+                                  <td className="p-4">
+                                     {isEditingFare ? (
+                                        <div className="flex items-center gap-2">
+                                           <input 
+                                             type="number" step="1"
+                                             value={tempFareConfig.discountRate}
+                                             onChange={(e) => setTempFareConfig({...tempFareConfig, discountRate: parseFloat(e.target.value)})}
+                                             className="w-24 p-2 border border-slate-300 rounded font-bold text-orange-600 focus:ring-2 focus:ring-blue-500 outline-none"
+                                           />
+                                           <span className="text-slate-400 text-xs">%</span>
+                                        </div>
+                                     ) : (
+                                        <span className="font-bold text-orange-600">{fareConfig.discountRate}%</span>
+                                     )}
+                                  </td>
+                                  <td className="p-4 text-slate-500">Percentage off for Students, PWDs, and Seniors</td>
+                              </tr>
                           </tbody>
                       </table>
                     </form>
@@ -1100,9 +1550,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                 </div>
             </div>
          );
-
-      case 'Locations': // Fallthrough for map
-        return null;
 
       default:
         return null;
@@ -1139,6 +1586,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                     <p className="text-slate-200 text-xs mt-1">
                       {isAdmin ? 'Admin Panel' : `Welcome, ${user.username}`}
                     </p>
+                    {user.role === UserRole.USER && user.discountType && user.discountType !== 'None' && (
+                        <span className="inline-block mt-1 text-[10px] font-bold bg-white/20 px-2 py-0.5 rounded text-white border border-white/30">
+                            {user.discountType}
+                        </span>
+                    )}
                  </div>
               </div>
               <button onClick={onLogout} className="p-2 hover:bg-white/10 rounded-lg text-slate-200 hover:text-white transition-colors">
@@ -1164,22 +1616,15 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                        <MessageSquare className="w-5 h-5" /> Feedbacks
                     </button>
                     <div className="h-px bg-slate-200 my-2 mx-4"></div>
-                    <p className="px-4 text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Route Management</p>
+                    
+                    {/* Consolidated Route Management */}
+                    <p className="px-4 text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Logistics</p>
                     <button 
-                       onClick={() => setActiveAdminMenu('Routes')}
-                       className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${activeAdminMenu === 'Routes' ? 'bg-green-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}`}>
-                       <Route className="w-5 h-5" /> Routes
+                       onClick={() => setActiveAdminMenu('Route Management')}
+                       className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${activeAdminMenu === 'Route Management' ? 'bg-green-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}`}>
+                       <Route className="w-5 h-5" /> Route Management
                     </button>
-                    <button 
-                       onClick={() => setActiveAdminMenu('Terminals')}
-                       className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${activeAdminMenu === 'Terminals' ? 'bg-green-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}`}>
-                       <Warehouse className="w-5 h-5" /> Terminals
-                    </button>
-                    <button 
-                       onClick={() => setActiveAdminMenu('Locations')}
-                       className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${activeAdminMenu === 'Locations' ? 'bg-green-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}`}>
-                       <MapPin className="w-5 h-5" /> Locations (Map)
-                    </button>
+                    
                     <button 
                        onClick={() => setActiveAdminMenu('Fares')}
                        className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${activeAdminMenu === 'Fares' ? 'bg-green-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}`}>
@@ -1226,11 +1671,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                 {/* Route Tab Content */}
                 {activeTab === 'route' && (
                   <div className="p-6 space-y-6">
-                    
                     {/* Live Navigation Mode UI */}
                     {isNavigating && routeStats ? (
                         <div className="bg-white p-6 rounded-xl shadow-lg border border-blue-200 space-y-6 animate-in fade-in zoom-in duration-300">
-                            <div className="flex items-center justify-between">
+                             {/* ... (Existing Nav UI) ... */}
+                             <div className="flex items-center justify-between">
                                 <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
                                     <span className="relative flex h-3 w-3">
                                       <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
@@ -1242,7 +1687,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                     On Route
                                 </div>
                             </div>
-
                             {/* Trip Details Card */}
                             <div className="space-y-4">
                                  {/* Origin -> Dest */}
@@ -1275,7 +1719,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                          <p className="text-lg font-bold text-slate-800">{routeStats.totalDuration}</p>
                                      </div>
                                      <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
-                                         <p className="text-xs text-slate-500 mb-1">Fare</p>
+                                         <p className="text-xs text-slate-500 mb-1">Fare {user.discountType && user.discountType !== 'None' && <span className="text-[9px] bg-green-100 text-green-700 px-1 rounded ml-1 font-bold">-{fareConfig.discountRate}%</span>}</p>
                                          <p className="text-lg font-bold text-green-600">{routeStats.fare}</p>
                                      </div>
                                  </div>
@@ -1301,8 +1745,24 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                     /* Default Search Form */
                     <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 relative">
                       
+                      {/* Route Direction Toggle */}
+                      <div className="flex bg-slate-100 p-1 rounded-lg mb-4">
+                        <button 
+                            className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-bold rounded-md transition-all ${routeDirection === 'forward' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+                            onClick={() => setRouteDirection('forward')}
+                        >
+                            <span>Forward (To Maharlika)</span>
+                        </button>
+                        <button 
+                            className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-bold rounded-md transition-all ${routeDirection === 'backward' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+                            onClick={() => setRouteDirection('backward')}
+                        >
+                            <span>Backward (To T.Sora)</span>
+                        </button>
+                      </div>
+
                       {/* Visual Connector Lines */}
-                      <div className="absolute left-7 top-10 bottom-10 flex flex-col items-center">
+                      <div className="absolute left-7 top-[5.5rem] bottom-10 flex flex-col items-center">
                           <div className="w-0.5 grow border-l-2 border-dotted border-slate-300"></div>
                       </div>
 
@@ -1318,21 +1778,23 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                           onPickMap={() => handleStartPick('origin')}
                         />
 
-                        {/* TERMINAL STOPOVER INDICATOR */}
-                        <div className="pl-12 pr-2 py-1">
-                            <div className="bg-orange-50 border border-orange-100 rounded-lg p-2 flex items-center gap-3">
-                                <div className="bg-orange-100 p-1.5 rounded-full text-orange-600">
-                                    <Warehouse className="w-3 h-3" />
+                        {/* SMART ROUTING INDICATOR */}
+                        <div className="pl-12 pr-2 py-1 animate-in fade-in duration-300">
+                            <div className="bg-green-50 border border-green-100 rounded-lg p-2 flex items-center gap-3">
+                                <div className="bg-green-100 p-1.5 rounded-full text-green-600">
+                                    <Route className="w-3 h-3" />
                                 </div>
                                 <div>
-                                    <p className="text-xs font-bold text-orange-800 uppercase tracking-wide">Via Terminal</p>
-                                    <p className="text-[10px] text-orange-600 font-medium">Tandang Sora Market</p>
+                                    <p className="text-xs font-bold text-green-800 uppercase tracking-wide">Smart Routing</p>
+                                    <p className="text-[10px] text-green-600 font-medium">
+                                        Boarding at nearest route point
+                                    </p>
                                 </div>
                             </div>
                         </div>
 
                         {/* Swap Button (Floating) */}
-                        <div className="absolute right-0 top-12 z-10">
+                        <div className="absolute right-0 top-[4.5rem] z-10">
                             <button 
                                onClick={handleSwapLocations}
                                className="p-2 bg-white rounded-full border border-slate-200 text-blue-600 hover:bg-blue-50 shadow-sm transition-all"
@@ -1365,7 +1827,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                       </div>
                     </div>
                     ) : (
-                    /* NEW JOURNEY DETAILS UI (Replaces Search Form when route found & !navigating) */
+                    /* NEW JOURNEY DETAILS UI */
                     <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
                         {/* Header */}
                         <div className="flex justify-between items-start mb-4">
@@ -1394,16 +1856,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                             <div className="text-center flex-1">
                                 <DollarSign className="w-4 h-4 text-green-600 mx-auto mb-1" />
                                 <div className="font-bold text-green-600">{routeStats.fare}</div>
-                                <div className="text-[10px] text-green-600 uppercase tracking-wide">Total Fare</div>
+                                <div className="text-[10px] text-green-600 uppercase tracking-wide flex justify-center items-center gap-1">
+                                    Total Fare
+                                    {user.discountType && user.discountType !== 'None' && (
+                                        <span className="bg-green-100 text-green-700 px-1 rounded text-[8px]">-{fareConfig.discountRate}%</span>
+                                    )}
+                                </div>
                             </div>
                         </div>
 
-                        <h3 className="text-sm font-medium text-slate-600 mb-4">Journey Details (2 rides)</h3>
+                        <h3 className="text-sm font-medium text-slate-600 mb-4">Journey Details (3 Legs)</h3>
 
                         {/* Timeline Container */}
                         <div className="space-y-0 relative pl-2">
                             
-                            {/* LEG 1: START */}
+                            {/* LEG 1: WALK TO PICKUP */}
                             <div className="flex gap-3 relative z-10">
                                 <div className="flex flex-col items-center">
                                     <div className="w-6 h-6 rounded-full bg-green-600 text-white flex items-center justify-center text-xs font-bold shadow-sm ring-2 ring-white">1</div>
@@ -1411,7 +1878,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                 </div>
                                 <div className="flex-1 pb-6 bg-white border border-slate-100 rounded-xl p-3 shadow-sm mb-4">
                                     <div className="flex justify-between font-bold text-sm mb-1">
-                                        <span className="text-slate-800">Start Journey</span>
+                                        <span className="text-slate-800">Walk to Pickup</span>
                                         <span className="text-green-600 text-xs bg-green-50 px-2 py-0.5 rounded">Free</span>
                                     </div>
                                     
@@ -1424,12 +1891,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                                 <span className="text-xs font-bold bg-orange-500 text-white px-1.5 py-0.5 rounded">Walk / Tricycle</span>
                                                 <span className="text-[10px] border border-slate-200 text-slate-500 px-1.5 py-0.5 rounded">Access</span>
                                             </div>
-                                            <p className="text-xs text-slate-600 line-clamp-2">{originInput}</p>
-                                            <div className="flex items-center gap-1 mt-1 text-[10px] text-slate-400">
-                                                <span>To: {TERMINAL_NAME}</span>
-                                            </div>
+                                            <p className="text-xs text-slate-600 line-clamp-2">From: {originInput}</p>
                                             <div className="flex items-center gap-3 mt-2 text-[10px] text-slate-500">
-                                               <span className="flex items-center gap-1"><Clock className="w-3 h-3"/> {routeStats.legs?.[0]?.duration?.text || '10m'}</span>
+                                               <span className="flex items-center gap-1"><Clock className="w-3 h-3"/> {routeStats.legs?.[0]?.calculatedWalkingDuration || '10m'}</span>
                                                <span className="flex items-center gap-1"><MapPinIcon className="w-3 h-3"/> {routeStats.legs?.[0]?.distance?.text || '1km'}</span>
                                             </div>
                                         </div>
@@ -1437,18 +1901,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                 </div>
                             </div>
 
-                            {/* TRANSFER BUTTON (Visual Only) */}
-                            <div className="flex justify-center mb-4 relative z-20 -mt-2">
-                                <div className="bg-white border border-orange-200 text-orange-600 px-3 py-1.5 rounded-full text-xs font-bold shadow-sm flex items-center gap-1">
-                                    <ArrowRight className="w-3 h-3" /> Transfer to next ride
-                                </div>
-                            </div>
-
-                            {/* LEG 2: JEEPNEY CARD */}
+                            {/* LEG 2: JEEPNEY RIDE */}
                             <div className="flex gap-3 relative z-10">
                                 <div className="flex flex-col items-center">
                                     {/* Connector line from top */}
                                     <div className="absolute top-0 bottom-0 left-[11px] w-0.5 bg-slate-200 -z-10"></div> 
+                                    <div className="w-6 h-6 rounded-full bg-blue-600 text-white flex items-center justify-center text-xs font-bold shadow-sm ring-2 ring-white z-10">2</div>
+                                    <div className="w-0.5 flex-1 bg-slate-200 my-1"></div>
                                 </div>
                                 <div className="flex-1">
                                     <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm mb-2 relative">
@@ -1462,32 +1921,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                                        <span className="text-xs font-bold bg-blue-600 text-white px-1.5 py-0.5 rounded">Jeepney</span>
                                                        <span className="text-[10px] border border-slate-200 text-slate-500 px-1.5 py-0.5 rounded">Public</span>
                                                    </div>
-                                                   <p className="text-xs font-medium text-slate-700">Tandang Sora Route</p>
+                                                   <p className="text-xs font-medium text-slate-700">
+                                                       {routeDirection === 'forward' ? 'To Maharlika' : 'To Tandang Sora'}
+                                                   </p>
                                                </div>
                                             </div>
                                             <div className="font-bold text-green-600 text-sm">{routeStats.fare}</div>
                                         </div>
                                         
-                                        {/* Timeline dots inside card */}
-                                        <div className="relative pl-3 space-y-4">
-                                            <div className="absolute left-[5.5px] top-1.5 bottom-1.5 w-0.5 bg-slate-200 border-l border-dashed border-slate-300"></div>
-                                            
-                                            <div className="relative">
-                                                <div className="absolute -left-3 top-1 w-2.5 h-2.5 rounded-full bg-green-500 ring-2 ring-white"></div>
-                                                <div className="ml-2">
-                                                    <p className="text-[10px] text-slate-400 uppercase font-bold">From</p>
-                                                    <p className="text-xs font-medium text-slate-800">{TERMINAL_NAME}</p>
-                                                </div>
-                                            </div>
-                                            <div className="relative">
-                                                <div className="absolute -left-3 top-1 w-2.5 h-2.5 rounded-full bg-red-500 ring-2 ring-white"></div>
-                                                <div className="ml-2">
-                                                    <p className="text-[10px] text-slate-400 uppercase font-bold">To</p>
-                                                    <p className="text-xs font-medium text-slate-800">{destinationInput}</p>
-                                                </div>
-                                            </div>
-                                        </div>
-
                                         <div className="flex items-center gap-4 mt-4 pt-3 border-t border-slate-50">
                                             <span className="flex items-center gap-1 text-xs text-slate-500">
                                                 <Clock className="w-3 h-3" /> {routeStats.legs?.[1]?.duration?.text || 'N/A'}
@@ -1495,24 +1936,37 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                             <span className="flex items-center gap-1 text-xs text-slate-500">
                                                 <MapPinIcon className="w-3 h-3" /> {routeStats.legs?.[1]?.distance?.text || 'N/A'}
                                             </span>
-                                            <span className="text-xs text-slate-400 ml-auto">Est. High Traffic</span>
                                         </div>
                                     </div>
                                 </div>
                             </div>
 
-                            {/* END NODE */}
-                            <div className="flex gap-3 relative z-10 mt-2">
+                            {/* LEG 3: WALK TO DESTINATION */}
+                            <div className="flex gap-3 relative z-10 mt-4">
                                 <div className="flex flex-col items-center">
-                                    <div className="w-6 h-6 rounded-full bg-green-600 text-white flex items-center justify-center text-xs font-bold shadow-sm ring-2 ring-white">2</div>
+                                    <div className="w-6 h-6 rounded-full bg-green-600 text-white flex items-center justify-center text-xs font-bold shadow-sm ring-2 ring-white">3</div>
                                 </div>
                                 <div className="flex-1 pt-0.5">
-                                    <div className="flex justify-between font-bold text-sm">
-                                        <span className="text-slate-800">Final Ride / Arrived</span>
-                                        <span className="text-green-600 text-xs bg-green-50 px-2 py-0.5 rounded">{routeStats.fare}</span>
+                                    <div className="bg-white border border-slate-100 rounded-xl p-3 shadow-sm">
+                                        <div className="flex justify-between font-bold text-sm mb-1">
+                                            <span className="text-slate-800">Walk to Destination</span>
+                                        </div>
+                                        <div className="flex gap-3 mt-2">
+                                            <div className="p-2 bg-orange-100 text-orange-600 rounded-lg h-fit">
+                                                <Footprints className="w-4 h-4" />
+                                            </div>
+                                            <div>
+                                                <p className="text-xs text-slate-600">Arrive at: {destinationInput}</p>
+                                                 <div className="flex items-center gap-3 mt-1 text-[10px] text-slate-500">
+                                                   <span className="flex items-center gap-1"><Clock className="w-3 h-3"/> {routeStats.legs?.[2]?.calculatedWalkingDuration || '5m'}</span>
+                                                   <span className="flex items-center gap-1"><MapPinIcon className="w-3 h-3"/> {routeStats.legs?.[2]?.distance?.text || '200m'}</span>
+                                                </div>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
+
                         </div>
 
                         {/* Fixed Bottom Actions */}
@@ -1543,14 +1997,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                              <h3 className="font-bold text-slate-800 flex items-center gap-2">
                                  <History className="w-5 h-5 text-blue-600" /> Trip History
                              </h3>
-                             {tripHistory.length > 0 && (
-                                <button 
-                                    onClick={handleClearHistory}
-                                    className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1 font-medium bg-red-50 px-2 py-1 rounded"
-                                >
-                                    <Trash2 className="w-3 h-3" /> Clear
-                                </button>
-                             )}
                         </div>
                         
                         <div className="flex-1 overflow-y-auto space-y-3 pb-4">
@@ -1563,7 +2009,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                                 tripHistory.map((item) => (
                                     <button 
                                         key={item.id}
-                                        onClick={() => handleReuseHistory(item)}
+                                        onClick={() => setViewingHistoryItem(item)} // OPEN DETAILED MODAL
                                         className="w-full bg-white p-4 rounded-xl shadow-sm border border-slate-200 hover:border-blue-400 hover:shadow-md transition-all text-left group"
                                     >
                                         <div className="flex items-start justify-between mb-2">
@@ -1601,6 +2047,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
                 {/* Chat Tab Content */}
                 {activeTab === 'chat' && (
                   <div className="flex flex-col h-full">
+                    {/* ... (Existing Chat UI) ... */}
                     <div className="flex-1 p-4 space-y-4">
                       {chatHistory.map((msg) => (
                         <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
@@ -1678,12 +2125,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
 
       {/* Main Content Area */}
       <main className="flex-1 relative h-full w-full flex flex-col min-w-0"> 
-         {/* min-w-0 is crucial for flex children to shrink properly */}
-
-         {/* Mobile/Desktop Header Toggle (Visible only when sidebar closed?) 
-             We can show it only when sidebar is closed to avoid duplication with the sidebar's internal close button.
-         */}
+         {/* ... (Main Content: Map/Dashboard Overlays) ... */}
          
+         {/* Mobile/Desktop Header Toggle */}
          {!sidebarOpen && !pickingMode && (
              <div className="absolute top-4 left-4 z-[1000]">
                 <button 
@@ -1696,7 +2140,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
          )}
 
          {/* Admin Dashboard Overlay (Now relative to this flex-1 container) */}
-         {isAdmin && (['Routes', 'Terminals', 'Locations'].indexOf(activeAdminMenu) === -1) && (
+         {isAdmin && (['Route Management'].indexOf(activeAdminMenu) === -1) && (
              <div className="absolute inset-0 bg-slate-50/95 backdrop-blur-sm z-10 animate-in fade-in duration-300 overflow-y-auto">
                  {renderAdminContent()}
              </div>
@@ -1704,14 +2148,18 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
          
          {/* Map */}
          <div className="flex-1 h-full w-full relative">
+             {/* Map renders the userActiveRoute path */}
             <MapWithRoute 
-               userLocation={userLocation} 
-               stops={stops}
+               userLocation={userLocation}
+               routePath={userActiveRoute.path} 
+               stops={userActiveRoute.stops}    
                searchRoute={searchTrigger}
                onRouteStatsCalculated={handleRouteStatsCalculated}
                selectionMode={pickingMode}
                onMapClick={handleMapClick}
                focusedLocation={focusedLocation}
+               tempOrigin={selectedOriginCoords}
+               tempDestination={selectedDestinationCoords}
             />
              
              {/* Map Selection Overlay Banner */}
@@ -1738,61 +2186,108 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
          
       </main>
 
-      {/* Feedback Modal */}
+      {/* Feedback Modal (Upgraded) */}
       {showFeedbackModal && (
         <div className="absolute inset-0 z-[2000] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
             <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
-                <div className="p-6">
-                    <div className="flex justify-between items-center mb-4">
-                        <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
-                            <MessageSquare className="w-5 h-5 text-blue-600" />
-                            Send Feedback
-                        </h3>
-                        <button onClick={() => setShowFeedbackModal(false)} className="text-slate-400 hover:text-slate-600 transition-colors">
-                            <X className="w-5 h-5" />
+                <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                    <div className="flex gap-4">
+                        <button 
+                           onClick={() => setFeedbackModalTab('new')}
+                           className={`text-sm font-bold pb-2 border-b-2 transition-colors ${feedbackModalTab === 'new' ? 'text-blue-600 border-blue-600' : 'text-slate-500 border-transparent hover:text-slate-800'}`}
+                        >
+                           Report Issue
+                        </button>
+                        <button 
+                           onClick={() => setFeedbackModalTab('history')}
+                           className={`text-sm font-bold pb-2 border-b-2 transition-colors ${feedbackModalTab === 'history' ? 'text-blue-600 border-blue-600' : 'text-slate-500 border-transparent hover:text-slate-800'}`}
+                        >
+                           My Reports
                         </button>
                     </div>
-                    
-                    <form onSubmit={handleFeedbackSubmit}>
-                        <div className="mb-4">
-                            <label className="block text-sm font-medium text-slate-700 mb-2">Issue Type</label>
-                            <div className="flex gap-2">
-                                <button 
-                                    type="button"
-                                    onClick={() => setFeedbackType('bug')}
-                                    className={`flex-1 py-2 rounded-lg text-sm font-medium border transition-all ${feedbackType === 'bug' ? 'bg-red-50 border-red-200 text-red-600' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}
-                                >
-                                    Bug Report
-                                </button>
-                                <button 
-                                    type="button"
-                                    onClick={() => setFeedbackType('suggestion')}
-                                    className={`flex-1 py-2 rounded-lg text-sm font-medium border transition-all ${feedbackType === 'suggestion' ? 'bg-blue-50 border-blue-200 text-blue-600' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}
-                                >
-                                    Suggestion
-                                </button>
+                    <button onClick={() => setShowFeedbackModal(false)} className="text-slate-400 hover:text-slate-600 transition-colors">
+                        <X className="w-5 h-5" />
+                    </button>
+                </div>
+                
+                <div className="p-6 max-h-[70vh] overflow-y-auto">
+                    {feedbackModalTab === 'new' ? (
+                        <form onSubmit={handleFeedbackSubmit}>
+                            <div className="mb-4">
+                                <label className="block text-sm font-medium text-slate-700 mb-2">Issue Type</label>
+                                <div className="flex gap-2">
+                                    <button 
+                                        type="button"
+                                        onClick={() => setFeedbackType('bug')}
+                                        className={`flex-1 py-2 rounded-lg text-sm font-medium border transition-all ${feedbackType === 'bug' ? 'bg-red-50 border-red-200 text-red-600' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}
+                                    >
+                                        Bug Report
+                                    </button>
+                                    <button 
+                                        type="button"
+                                        onClick={() => setFeedbackType('suggestion')}
+                                        className={`flex-1 py-2 rounded-lg text-sm font-medium border transition-all ${feedbackType === 'suggestion' ? 'bg-blue-50 border-blue-200 text-blue-600' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}
+                                    >
+                                        Suggestion
+                                    </button>
+                                </div>
                             </div>
-                        </div>
 
-                        <div className="mb-4">
-                            <label className="block text-sm font-medium text-slate-700 mb-2">Description</label>
-                            <textarea 
-                                value={feedbackText}
-                                onChange={(e) => setFeedbackText(e.target.value)}
-                                className="w-full h-32 bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-blue-500 outline-none resize-none"
-                                placeholder={feedbackType === 'bug' ? "Describe the error you encountered..." : "Share your ideas with us..."}
-                                required
-                            ></textarea>
-                        </div>
+                            <div className="mb-4">
+                                <label className="block text-sm font-medium text-slate-700 mb-2">Description</label>
+                                <textarea 
+                                    value={feedbackText}
+                                    onChange={(e) => setFeedbackText(e.target.value)}
+                                    className="w-full h-32 bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+                                    placeholder={feedbackType === 'bug' ? "Describe the error you encountered..." : "Share your ideas with us..."}
+                                    required
+                                ></textarea>
+                            </div>
 
-                        <button 
-                            type="submit" 
-                            disabled={isSubmittingFeedback || !feedbackText.trim()}
-                            className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold shadow-lg hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
-                        >
-                            {isSubmittingFeedback ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Submit Feedback'}
-                        </button>
-                    </form>
+                            <button 
+                                type="submit" 
+                                disabled={isSubmittingFeedback || !feedbackText.trim()}
+                                className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold shadow-lg hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
+                            >
+                                {isSubmittingFeedback ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Submit Feedback'}
+                            </button>
+                        </form>
+                    ) : (
+                        <div className="space-y-4">
+                            {feedbacks.filter(f => f.sender === user.username).length === 0 ? (
+                                <div className="text-center py-10 text-slate-400">
+                                    <MessageSquare className="w-10 h-10 mx-auto mb-2 opacity-50" />
+                                    <p className="text-sm">You haven't submitted any reports yet.</p>
+                                </div>
+                            ) : (
+                                feedbacks.filter(f => f.sender === user.username).map(f => (
+                                    <div key={f.id} className="bg-slate-50 rounded-xl p-4 border border-slate-100">
+                                        <div className="flex justify-between items-center mb-2">
+                                            <span className={`px-2 py-0.5 text-[10px] font-bold uppercase rounded ${f.type === 'bug' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}`}>{f.type}</span>
+                                            <span className={`px-2 py-0.5 text-[10px] font-bold uppercase rounded ${f.status === 'resolved' ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}`}>{f.status}</span>
+                                        </div>
+                                        <p className="text-sm text-slate-700 mb-2">{f.description}</p>
+                                        <p className="text-[10px] text-slate-400 text-right">{f.date}</p>
+                                        
+                                        {/* User View of Admin Reply */}
+                                        {f.adminReply && (
+                                            <div className="mt-3 pt-3 border-t border-slate-200">
+                                                <div className="flex items-start gap-2">
+                                                    <div className="mt-0.5 p-1 bg-green-100 rounded-full text-green-600">
+                                                        <MessageCircle className="w-3 h-3" />
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-[10px] font-bold text-slate-500 uppercase">Support Response</p>
+                                                        <p className="text-xs text-slate-600 mt-0.5">{f.adminReply}</p>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    )}
                 </div>
             </div>
         </div>
@@ -1804,6 +2299,133 @@ export const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
               <CheckCircle className="w-4 h-4" />
               <span className="font-medium text-sm">Feedback sent successfully!</span>
           </div>
+      )}
+
+      {/* Trip History Detail Modal */}
+      {viewingHistoryItem && (
+         <div className="absolute inset-0 z-[2000] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200 flex flex-col max-h-[90vh]">
+               <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                  <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                     <History className="w-5 h-5 text-blue-600" />
+                     Trip Details
+                  </h3>
+                  <button onClick={() => setViewingHistoryItem(null)} className="text-slate-400 hover:text-slate-600 transition-colors">
+                     <X className="w-5 h-5" />
+                  </button>
+               </div>
+
+               <div className="p-6 overflow-y-auto">
+                   <div className="flex justify-between items-center mb-6">
+                       <div>
+                           <div className="text-xs font-bold text-slate-400 uppercase tracking-wide mb-1">Date</div>
+                           <div className="text-slate-800 font-medium">{viewingHistoryItem.date}</div>
+                       </div>
+                       <div className="text-right">
+                           <div className="text-xs font-bold text-slate-400 uppercase tracking-wide mb-1">Time</div>
+                           <div className="text-slate-800 font-medium">{viewingHistoryItem.time}</div>
+                       </div>
+                   </div>
+
+                   <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 mb-6 flex justify-around text-center">
+                       <div>
+                           <div className="text-lg font-bold text-slate-800">{viewingHistoryItem.totalDuration}</div>
+                           <div className="text-[10px] uppercase font-bold text-slate-400">Duration</div>
+                       </div>
+                       <div className="w-px bg-slate-200"></div>
+                       <div>
+                           <div className="text-lg font-bold text-slate-800">{viewingHistoryItem.totalDistance}</div>
+                           <div className="text-[10px] uppercase font-bold text-slate-400">Distance</div>
+                       </div>
+                       <div className="w-px bg-slate-200"></div>
+                       <div>
+                           <div className="text-lg font-bold text-green-600">{viewingHistoryItem.fare}</div>
+                           <div className="text-[10px] uppercase font-bold text-green-600">Total Fare</div>
+                       </div>
+                   </div>
+
+                   <h4 className="font-bold text-slate-700 mb-4 text-sm">Detailed Itinerary</h4>
+                   <div className="space-y-0 relative pl-2">
+                        {/* Start Leg */}
+                        <div className="flex gap-3 relative z-10 pb-6">
+                             <div className="flex flex-col items-center">
+                                 <div className="w-6 h-6 rounded-full bg-green-600 text-white flex items-center justify-center text-xs font-bold shadow-sm ring-2 ring-white">1</div>
+                                 <div className="w-0.5 flex-1 bg-slate-200 my-1 absolute top-6 bottom-0"></div>
+                             </div>
+                             <div className="flex-1">
+                                 <div className="text-sm font-bold text-slate-800 mb-1">Walk to Pickup</div>
+                                 <div className="text-xs text-slate-500 mb-2">{viewingHistoryItem.origin}</div>
+                                 <div className="flex gap-2">
+                                     <span className="text-[10px] bg-orange-100 text-orange-700 px-2 py-0.5 rounded font-medium flex items-center gap-1">
+                                        <Footprints className="w-3 h-3" /> Walk
+                                     </span>
+                                     <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">
+                                        {viewingHistoryItem.legs?.[0]?.calculatedWalkingDuration || 'N/A'}
+                                     </span>
+                                     <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">
+                                        {viewingHistoryItem.legs?.[0]?.distance?.text || 'N/A'}
+                                     </span>
+                                 </div>
+                             </div>
+                        </div>
+
+                        {/* Jeep Leg */}
+                        <div className="flex gap-3 relative z-10 pb-6">
+                             <div className="flex flex-col items-center">
+                                 <div className="w-6 h-6 rounded-full bg-blue-600 text-white flex items-center justify-center text-xs font-bold shadow-sm ring-2 ring-white">2</div>
+                                 <div className="w-0.5 flex-1 bg-slate-200 my-1 absolute top-6 bottom-0"></div>
+                             </div>
+                             <div className="flex-1">
+                                 <div className="text-sm font-bold text-slate-800 mb-1">Jeepney Ride</div>
+                                 <div className="text-xs text-slate-500 mb-2">Tandang Sora Route</div>
+                                 <div className="flex gap-2">
+                                     <span className="text-[10px] bg-blue-100 text-blue-700 px-2 py-0.5 rounded font-medium flex items-center gap-1">
+                                        <Bus className="w-3 h-3" /> Jeepney
+                                     </span>
+                                     <span className="text-[10px] bg-green-100 text-green-700 px-2 py-0.5 rounded font-medium">
+                                        {viewingHistoryItem.fare}
+                                     </span>
+                                     <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">
+                                        {viewingHistoryItem.legs?.[1]?.duration?.text || 'N/A'}
+                                     </span>
+                                 </div>
+                             </div>
+                        </div>
+
+                        {/* End Leg */}
+                        <div className="flex gap-3 relative z-10">
+                             <div className="flex flex-col items-center">
+                                 <div className="w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center text-xs font-bold shadow-sm ring-2 ring-white">3</div>
+                             </div>
+                             <div className="flex-1">
+                                 <div className="text-sm font-bold text-slate-800 mb-1">Arrive at Destination</div>
+                                 <div className="text-xs text-slate-500 mb-2">{viewingHistoryItem.destination}</div>
+                                 <div className="flex gap-2">
+                                     <span className="text-[10px] bg-orange-100 text-orange-700 px-2 py-0.5 rounded font-medium flex items-center gap-1">
+                                        <Footprints className="w-3 h-3" /> Walk
+                                     </span>
+                                     <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">
+                                        {viewingHistoryItem.legs?.[2]?.calculatedWalkingDuration || 'N/A'}
+                                     </span>
+                                     <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">
+                                        {viewingHistoryItem.legs?.[2]?.distance?.text || 'N/A'}
+                                     </span>
+                                 </div>
+                             </div>
+                        </div>
+                   </div>
+               </div>
+               
+               <div className="p-4 border-t border-slate-100 bg-slate-50">
+                  <button 
+                     onClick={() => handleReuseHistory(viewingHistoryItem)}
+                     className="w-full flex items-center justify-center gap-2 bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition-colors shadow-lg"
+                  >
+                     <Repeat className="w-4 h-4" /> Reuse Route
+                  </button>
+               </div>
+            </div>
+         </div>
       )}
     </div>
   );

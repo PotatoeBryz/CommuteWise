@@ -4,9 +4,12 @@ export enum UserRole {
   ADMIN = 'ADMIN'
 }
 
+export type DiscountType = 'None' | 'Student' | 'PWD' | 'Senior Citizen';
+
 export interface User {
   username: string;
   role: UserRole;
+  discountType?: DiscountType;
 }
 
 export interface Coordinates {
@@ -19,6 +22,15 @@ export interface RouteStop {
   name: string;
   coords: Coordinates;
   description?: string;
+  isTerminal?: boolean; // Added to distinguish terminals
+}
+
+export interface TransportRoute {
+  id: string;
+  name: string;
+  path: Coordinates[];
+  stops: RouteStop[];
+  status: 'active' | 'inactive';
 }
 
 export interface ChatMessage {
@@ -40,6 +52,14 @@ export interface FeedbackItem {
   date: string;
   status: 'pending' | 'resolved';
   sender: string;
+  adminReply?: string; // Added for admin responses
+}
+
+// Updated to include detailed leg info
+export interface RouteLeg {
+  distance: { text: string; value: number };
+  duration: { text: string; value: number }; // Raw API value (Driving)
+  calculatedWalkingDuration?: string; // Human realistic walking time
 }
 
 export interface TripHistoryItem {
@@ -51,4 +71,5 @@ export interface TripHistoryItem {
   totalDistance: string;
   totalDuration: string;
   fare: string;
+  legs: RouteLeg[]; // Added detailed legs
 }
